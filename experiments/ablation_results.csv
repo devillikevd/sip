@@ -1,0 +1,5 @@
+config,description,status,checkpoint,num_images,params,params_millions,psnr_db,ssim,lpips,niqe,infer_time_ms
+A,Illumination branch only (IlluminationCurveEstimator),untrained_verification,none (untrained random init),7,74317,0.0743,7.2942891120910645,0.22693940252065659,,,62.06488571063216
+B,Original MIRNet only (Baseline),untrained_verification,none (untrained random init),7,32212944,32.2129,6.694798537663051,0.13777883563722884,,,4041.0858999987663
+C,"MIRNet + Illumination estimation (Sequential, no Adaptive Fusion)",untrained_verification,none (untrained random init),7,32287261,32.2873,8.121134076799665,0.33583599967615946,,,4007.7638285583816
+D,MIRNet + Illumination estimation + Adaptive Feature Fusion (Proposed Hybrid),untrained_verification,none (untrained random init),7,32548771,32.5488,7.8152939251491,0.3031290216105325,,,4310.554114270157

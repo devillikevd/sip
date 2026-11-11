@@ -1,0 +1,61 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# ── Virtual environments ─────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── Jupyter ──────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# ── PyTorch checkpoints (large binary; push only intentionally) ──
+# Keep the directory structure, ignore the actual .pth files unless small
+experiments/*/checkpoints/*.pth
+experiments/*/checkpoints/*.pt
+experiments/_ui_uploaded_ckpt.pth
+baseline_results/smoke_test_run/checkpoints/*.pth
+
+# ── TensorBoard event files ──────────────────────────────
+**/events.out.tfevents.*
+
+# ── Experiment outputs (auto-generated; not code) ────────
+experiments_notebook/
+baseline_results/untrained_outputs/
+Results/ui_outputs/
+
+# ── OS ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDEs ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace
+
+# ── Coverage / testing cache ─────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# ── Distribution / packaging ─────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+
+# ── Misc ─────────────────────────────────────────────────
+*.log
+*.swp
+*.swo
+~$*
+

@@ -1,0 +1,24 @@
+# Core Deep Learning & Vision
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+tqdm>=4.65.0
+tensorboard>=2.14.0
+
+# Metrics, Plotting & Tabular Analysis
+scikit-image>=0.21.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+pandas>=2.0.0
+
+# Interactive Demo UI
+streamlit>=1.28.0
+
+# Optional Colab / Evaluation Dependencies (LPIPS, NIQE, LOL Download)
+# Install in Google Colab or GPU environments via:
+#   pip install lpips pyiqa gdown
+lpips>=0.1.4; platform_system != "Windows"
+pyiqa>=0.1.10; platform_system != "Windows"
+gdown>=5.0.0; platform_system != "Windows"

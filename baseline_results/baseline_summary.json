@@ -1,0 +1,110 @@
+{
+  "device": "cpu",
+  "environment": {
+    "python_version": "3.13.9",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "cuda_available": false,
+    "cuda_device_count": 0,
+    "cuda_device_name": null,
+    "packages": {
+      "torch": "2.12.1+cpu",
+      "torchvision": "0.27.1+cpu",
+      "numpy": "2.3.5",
+      "cv2": "4.13.0",
+      "PIL": "12.3.0",
+      "tqdm": "4.67.1",
+      "tensorboard": "2.21.0",
+      "skimage": "0.26.0",
+      "scipy": "1.16.3",
+      "matplotlib": "3.10.6",
+      "pandas": "2.3.3",
+      "streamlit": "1.51.0"
+    },
+    "missing": []
+  },
+  "checkpoint_check": {
+    "pretrained_checkpoints_found": [],
+    "has_pretrained_checkpoint": false,
+    "note": "No pretrained .pth/.pt checkpoint exists in the upstream repository."
+  },
+  "dataset_check": {
+    "checked_candidates": [
+      "D:\\sip project submission\\data\\LOL",
+      "D:\\sip project submission\\data\\Loldataset",
+      "/content/Data/Loldataset"
+    ],
+    "existing_lol_dirs": [],
+    "full_lol_dataset_present": false
+  },
+  "lol_dataset_loader_check": {
+    "num_samples": 7,
+    "crop_tensor_shape": [
+      3,
+      64,
+      64
+    ],
+    "full_tensor_shape": [
+      3,
+      184,
+      276
+    ]
+  },
+  "model": {
+    "class_name": "MIRNet",
+    "total_params": 32212944,
+    "trainable_params": 32212944
+  },
+  "benchmarks": {
+    "64x64": {
+      "input_shape": [
+        1,
+        3,
+        64,
+        64
+      ],
+      "output_shape": [
+        1,
+        3,
+        64,
+        64
+      ],
+      "runs": 5,
+      "mean_ms": 434.06615999992937,
+      "std_ms": 10.172332524832614,
+      "min_ms": 421.78299999795854,
+      "max_ms": 444.471099996008
+    },
+    "184x276": {
+      "input_shape": [
+        1,
+        3,
+        184,
+        276
+      ],
+      "output_shape": [
+        1,
+        3,
+        184,
+        276
+      ],
+      "runs": 3,
+      "mean_ms": 4149.585466676702,
+      "std_ms": 152.37374066623394,
+      "min_ms": 3958.7659999961033,
+      "max_ms": 4331.699200032745
+    }
+  },
+  "metrics_csv": "baseline_results\\baseline_metrics.csv",
+  "training_smoke_test": {
+    "returncode": 0,
+    "elapsed_seconds": 24.12543909996748,
+    "checkpoint_saved": true,
+    "best_checkpoint_saved": true,
+    "checkpoint_reloaded_into_MIRNet": true,
+    "tensorboard_event_files": [
+      "D:\\sip project submission\\baseline_results\\smoke_test_run\\logs\\events.out.tfevents.1794332105.LAPTOP-V6CSJD0U.33536.0"
+    ],
+    "stdout_tail": "32])\ntorch.Size([2, 768, 16, 16])\ntorch.Size([2, 192, 64, 64])\ntorch.Size([2, 192, 64, 64])\ntorch.Size([2, 384, 32, 32])\ntorch.Size([2, 768, 16, 16])\ntorch.Size([2, 192, 64, 64])\ntorch.Size([2, 192, 64, 64])\ntorch.Size([2, 384, 32, 32])\ntorch.Size([2, 768, 16, 16])\ntorch.Size([2, 192, 64, 64])\ntorch.Size([2, 192, 64, 64])\ntorch.Size([2, 384, 32, 32])\ntorch.Size([2, 768, 16, 16])\ntorch.Size([2, 192, 64, 64])\ntorch.Size([1, 192, 128, 128])\ntorch.Size([1, 384, 64, 64])\ntorch.Size([1, 768, 32, 32])\ntorch.Size([1, 192, 128, 128])\ntorch.Size([1, 192, 128, 128])\ntorch.Size([1, 384, 64, 64])\ntorch.Size([1, 768, 32, 32])\ntorch.Size([1, 192, 128, 128])\ntorch.Size([1, 192, 128, 128])\ntorch.Size([1, 384, 64, 64])\ntorch.Size([1, 768, 32, 32])\ntorch.Size([1, 192, 128, 128])\ntorch.Size([1, 192, 128, 128])\ntorch.Size([1, 384, 64, 64])\ntorch.Size([1, 768, 32, 32])\ntorch.Size([1, 192, 128, 128])\ntorch.Size([1, 192, 128, 128])\ntorch.Size([1, 384, 64, 64])\ntorch.Size([1, 768, 32, 32])\ntorch.Size([1, 192, 128, 128])\ntorch.Size([1, 192, 128, 128])\ntorch.Size([1, 384, 64, 64])\ntorch.Size([1, 768, 32, 32])\ntorch.Size([1, 192, 128, 128])\nValidation Epoch: 0, Loss: 0.436465, PSNR: 6.7538 dB, SSIM: 0.3081.\n\n",
+    "stderr_tail": "rs. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.\nWARNING: All log messages before absl::InitializeLog() is called are written to STDERR\nI0000 00:00:1794332101.629615    8196 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.\n\n  0%|          | 0/4 [00:00<?, ?it/s]\n 25%|\u2588\u2588\u258c       | 1/4 [00:04<00:12,  4.01s/it]\n 50%|\u2588\u2588\u2588\u2588\u2588     | 2/4 [00:06<00:06,  3.08s/it]\n 50%|\u2588\u2588\u2588\u2588\u2588     | 2/4 [00:06<00:06,  3.23s/it]\n\n  0%|          | 0/4 [00:00<?, ?it/s]\n 25%|\u2588\u2588\u258c       | 1/4 [00:00<00:02,  1.27it/s]\n 50%|\u2588\u2588\u2588\u2588\u2588     | 2/4 [00:01<00:01,  1.28it/s]\n 50%|\u2588\u2588\u2588\u2588\u2588     | 2/4 [00:01<00:01,  1.27it/s]\n"
+  }
+}

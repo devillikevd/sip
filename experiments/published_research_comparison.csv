@@ -1,0 +1,11 @@
+method,source_type,dataset_split,training_paradigm,params_m,psnr_db,ssim,notes
+RetinexNet,"Published (Wei et al., BMVC 2018)",LOL eval15 (paired),Paired Retinex Decomposition,0.84,16.77,0.56,Standard benchmark score on LOL eval15 (various re-evaluations report 0.42–0.56 SSIM depending on RGB vs Y-channel metric).
+EnlightenGAN,"Published (Jiang et al., IEEE TIP 2021)",LOL eval15 (paired),Unpaired GAN,8.64,17.48,0.651,Trained unpaired; evaluated on LOL eval15.
+Zero-DCE,"Published (Guo et al., CVPR 2020)",LOL eval15 (paired),Zero-Reference Curve Estimation,0.079,14.86,0.559,Zero-reference training without ground-truth pairing (~79.4K params).
+Zero-DCE++,"Published (Li et al., IEEE TPAMI 2021)",LOL eval15 (paired),Zero-Reference Lightweight Curve,0.011,14.86,0.55,Lightweight depthwise-separable variant (~10.6K params); literature reports ~14.8–15.2 dB PSNR depending on protocol.
+MIRNet (Paper),"Published (Zamir et al., ECCV 2020)",LOL eval15 (paired),Paired Supervised Multi-Scale,31.79,24.14,0.83,Official ECCV 2020 MIRNet benchmark on LOL eval15.
+MIRNet (Baseline Reference),"Reference PyTorch README (2021)",LOL eval15 (64x64 patch setup),Paired Supervised (Charbonnier),32.21,22.97,,Reported in baseline PyTorch reference; no pretrained checkpoint included in repo.
+Local Config A,Local Run (untrained_verification),Local test (7 images),Illumination branch only (IlluminationCurveEstimator),0.0743,7.294289112091064,0.2269394025206565,Checkpoint: none (untrained random init)
+Local Config B,Local Run (untrained_verification),Local test (7 images),Original MIRNet only (Baseline),32.2129,6.694798537663051,0.1377788356372288,Checkpoint: none (untrained random init)
+Local Config C,Local Run (untrained_verification),Local test (7 images),"MIRNet + Illumination estimation (Sequential, no Adaptive Fusion)",32.2873,8.121134076799665,0.3358359996761594,Checkpoint: none (untrained random init)
+Local Config D,Local Run (untrained_verification),Local test (7 images),MIRNet + Illumination estimation + Adaptive Feature Fusion (Proposed Hybrid),32.5488,7.8152939251491,0.3031290216105325,Checkpoint: none (untrained random init)

@@ -1,0 +1,8 @@
+{
+  "device": "cpu",
+  "test_low": "D:\\sip project submission\\baseline_results\\samples\\low",
+  "test_high": "D:\\sip project submission\\baseline_results\\samples\\high",
+  "num_test_images": 7,
+  "lpips_status": "unavailable (lpips package not installed)",
+  "niqe_status": "unavailable (pyiqa package not installed)"
+}
