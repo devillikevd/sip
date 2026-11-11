@@ -46,45 +46,133 @@ from models.hybrid_mirnet import CONFIG_DESCRIPTIONS, build_ablation_model
 # (MSRCR + CLAHE + Shadow Lift + Denoise + Color Restore)
 # Works 100% out-of-the-box without any trained checkpoint
 # ──────────────────────────────────────────────────────────
+def _luma_f32(arr_f: np.ndarray) -> np.ndarray:
+    """Compute Rec.601 float32 luminance without implicit float64 promotion."""
+    return (
+        np.float32(0.299) * arr_f[:, :, 0]
+        + np.float32(0.587) * arr_f[:, :, 1]
+        + np.float32(0.114) * arr_f[:, :, 2]
+    ).astype(np.float32)
+
+
+def _guided_filter_f32(
+    guide: np.ndarray, src: np.ndarray, radius: int = 15, eps: float = 0.04
+) -> np.ndarray:
+    """Fast O(N) edge-preserving float32 Guided Filter (zero halo overshoot)."""
+    try:
+        import cv2
+        g = guide.astype(np.float32, copy=False)
+        s = src.astype(np.float32, copy=False)
+        k = (2 * radius + 1, 2 * radius + 1)
+        mean_I = cv2.boxFilter(g, cv2.CV_32F, k)
+        mean_p = cv2.boxFilter(s, cv2.CV_32F, k)
+        corr_I = cv2.boxFilter(g * g, cv2.CV_32F, k)
+        corr_Ip = cv2.boxFilter(g * s, cv2.CV_32F, k)
+        var_I = np.maximum(corr_I - mean_I * mean_I, np.float32(0.0)).astype(np.float32)
+        cov_Ip = (corr_Ip - mean_I * mean_p).astype(np.float32)
+        a = cov_Ip / (var_I + np.float32(eps))
+        b = mean_p - a * mean_I
+        mean_a = cv2.boxFilter(a, cv2.CV_32F, k)
+        mean_b = cv2.boxFilter(b, cv2.CV_32F, k)
+        return np.clip(mean_a * g + mean_b, 1e-4, 1.0).astype(np.float32)
+    except ImportError:
+        from PIL import ImageFilter
+        src_pil = Image.fromarray((np.clip(src, 0, 1) * 255).astype(np.uint8))
+        return np.array(src_pil.filter(ImageFilter.GaussianBlur(radius=12)), dtype=np.float32) / np.float32(255.0)
+
+
+def _estimate_noise_mad(lum_f: np.ndarray) -> float:
+    """Estimate high-frequency luminance noise floor robustly via Laplacian MAD."""
+    try:
+        import cv2
+        lap = cv2.Laplacian(lum_f.astype(np.float32, copy=False), cv2.CV_32F, ksize=3)
+        sigma = float(np.median(np.abs(lap))) / 0.6745 / 2.828
+        return float(np.clip(sigma, 0.0, 0.08))
+    except ImportError:
+        return 0.01
+
+
+def _edge_confidence(lum_f: np.ndarray, sigma: float = 1.0, gain: float = 3.8, threshold: float = 0.03) -> np.ndarray:
+    """Compute noise-immune edge confidence mask [0, 1] from smoothed Sobel gradients."""
+    try:
+        import cv2
+        sm = cv2.GaussianBlur(lum_f.astype(np.float32, copy=False), (0, 0), sigmaX=max(float(sigma), 0.5))
+        gx = cv2.Sobel(sm, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(sm, cv2.CV_32F, 0, 1, ksize=3)
+        return np.clip(np.hypot(gx, gy) * np.float32(gain) - np.float32(threshold), 0.0, 1.0).astype(np.float32)
+    except ImportError:
+        return np.zeros_like(lum_f, dtype=np.float32)
+
+
+def _apply_hd_clarity_tanh(
+    img_f: np.ndarray,
+    clarity: float = 0.40,
+    scale_factor: float = 1.0,
+    noise_level: float = 0.0,
+) -> np.ndarray:
+    """Apply single-pass, halo-free, tanh-bounded multi-scale DoG HD edge tightening."""
+    if clarity <= 0.01:
+        return img_f
+    try:
+        import cv2
+        y = np.clip(_luma_f32(img_f), 1e-4, 1.0).astype(np.float32)
+        r_sc = min(max(float(scale_factor), 1.0), 4.0)
+        sig_sm = (0.85 + min(noise_level * 18.0, 1.1)) * r_sc
+        sig_fine = 0.72 * r_sc
+        sig_med = 1.85 * r_sc
+        noise_gate = 0.025 + min(noise_level * 2.5, 0.08)
+        e_mask = _edge_confidence(y, sigma=sig_sm, gain=4.8 + 0.4 * r_sc, threshold=noise_gate)
+        dog = (
+            np.float32(0.68) * (y - cv2.GaussianBlur(y, (0, 0), sigmaX=sig_fine))
+            + np.float32(0.32) * (y - cv2.GaussianBlur(y, (0, 0), sigmaX=sig_med))
+        ).astype(np.float32)
+        lim = np.float32(0.088)
+        detail = lim * np.tanh((np.float32(2.0 + 2.5 * clarity) * dog) / lim) * e_mask
+        y_hd = np.clip(y + detail, 0.0, 1.0).astype(np.float32)
+        ratio = np.clip(y_hd / (y + np.float32(1e-4)), 0.76, 1.35)[:, :, None].astype(np.float32)
+        return np.clip(img_f * ratio, 0.0, 1.0).astype(np.float32)
+    except ImportError:
+        return img_f
+
+
 class ClassicalEnhancer:
     """
-    Production-grade classical low-light image enhancement pipeline:
-      1. Logarithmic shadow-lift & adaptive illumination estimation
-      2. Multi-Scale Retinex reflectance boost (recovers details in deep shadows)
-      3. CLAHE on L-channel in LAB color space (natural local contrast)
-      4. Bilateral edge-preserving denoising (removes dark-boosted grain)
-      5. Gray-world white balance + chromaticity preservation (zero color cast)
-      6. Subtle saturation & unsharp-mask detail recovery
+    Float32 High-Clarity Low-Light Image Enhancement Pipeline:
+      1. Structure-aware illumination estimation via adaptive Guided Filter
+      2. Pre-lift chroma & dark-shadow jitter suppression before amplification
+      3. Highlight-safe LIME/Retinex illumination & rational exposure fill-light
+      4. Noise-adaptive YCrCb NLM + Guided flat-shadow polish (zero blotches/halos)
+      5. Smooth 16-bit local contrast & shadow-protected midtone punch
+      6. Halo-free tanh-bounded HD edge clarity (never double-sharpened)
     """
 
-    def _guided_filter_gray(self, guide: np.ndarray, src: np.ndarray, radius: int = 15, eps: float = 1e-2) -> np.ndarray:
-        """Fast O(N) edge-preserving Guided Filter using box filters (prevents bright halos)."""
-        try:
-            import cv2
-            k = (2 * radius + 1, 2 * radius + 1)
-            mean_I = cv2.boxFilter(guide, cv2.CV_32F, k)
-            mean_p = cv2.boxFilter(src, cv2.CV_32F, k)
-            corr_I = cv2.boxFilter(guide * guide, cv2.CV_32F, k)
-            corr_Ip = cv2.boxFilter(guide * src, cv2.CV_32F, k)
-            var_I = corr_I - mean_I * mean_I
-            cov_Ip = corr_Ip - mean_I * mean_p
-            a = cov_Ip / (var_I + eps)
-            b = mean_p - a * mean_I
-            mean_a = cv2.boxFilter(a, cv2.CV_32F, k)
-            mean_b = cv2.boxFilter(b, cv2.CV_32F, k)
-            return np.clip(mean_a * guide + mean_b, 1e-3, 1.0)
-        except ImportError:
-            from PIL import ImageFilter
-            src_pil = Image.fromarray((np.clip(src, 0, 1) * 255).astype(np.uint8))
-            return np.array(src_pil.filter(ImageFilter.GaussianBlur(radius=12)), dtype=np.float32) / 255.0
+    def _guided_filter_gray(self, guide: np.ndarray, src: np.ndarray, radius: int = 15, eps: float = 0.04) -> np.ndarray:
+        return _guided_filter_f32(guide, src, radius=radius, eps=eps)
 
     def _estimate_illumination(self, img_f: np.ndarray) -> np.ndarray:
-        """LIME-inspired structure-aware illumination map from channel-wise max(R, G, B)."""
+        """LIME-inspired structure-aware illumination map with adaptive window radius."""
+        h, w = img_f.shape[:2]
         t0 = np.max(img_f, axis=2).astype(np.float32)
-        guide = (0.299 * img_f[:, :, 0] + 0.587 * img_f[:, :, 1] + 0.114 * img_f[:, :, 2]).astype(np.float32)
-        t_refined = self._guided_filter_gray(guide, t0, radius=15, eps=0.02)
-        # Ensure illumination stays smooth and strictly >= initial max luminance to prevent over-boosting
-        return np.clip(np.maximum(t_refined, 0.7 * t0), 0.015, 1.0)
+        guide = _luma_f32(img_f)
+        radius = max(12, min(32, min(h, w) // 10))
+        t_refined = _guided_filter_f32(guide, t0, radius=radius, eps=0.05)
+        return np.clip(np.maximum(t_refined, np.float32(0.75) * t0), 0.02, 1.0).astype(np.float32)
+
+    def _pre_denoise_float(self, img_f: np.ndarray, illum: np.ndarray, res_sc: float) -> np.ndarray:
+        """Suppress dark chroma noise & 8-bit shadow stepping before Retinex gain."""
+        try:
+            import cv2
+            yc = cv2.cvtColor(img_f.astype(np.float32, copy=False), cv2.COLOR_RGB2YCrCb)
+            sig_c = 1.6 * res_sc
+            yc[:, :, 1] = cv2.GaussianBlur(yc[:, :, 1], (0, 0), sigmaX=sig_c)
+            yc[:, :, 2] = cv2.GaussianBlur(yc[:, :, 2], (0, 0), sigmaX=sig_c)
+            d_bi = 5 if res_sc < 1.5 else 7
+            y_bi = cv2.bilateralFilter(yc[:, :, 0], d=d_bi, sigmaColor=0.05, sigmaSpace=1.8 * res_sc)
+            sw = np.clip((np.float32(0.32) - illum) / np.float32(0.32), 0.0, 0.80).astype(np.float32)
+            yc[:, :, 0] = yc[:, :, 0] * (np.float32(1.0) - sw) + y_bi * sw
+            return np.clip(cv2.cvtColor(yc, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
+        except ImportError:
+            return img_f
 
     def _retinex_lift(
         self,
@@ -94,183 +182,146 @@ class ClassicalEnhancer:
         light_boost: float = 0.85,
         exposure_ev: float = 0.50,
     ) -> np.ndarray:
-        """
-        Highlight-Safe LIME/Retinex + Rational Exposure Tone Curve:
-          1. Adapts dark illumination toward well-exposed daylight without clipping white details.
-          2. Applies smooth rational exposure lift `L * (1 + k) / (1 + k * L)` so midtones &
-             shadows brighten strongly while lamps, sky, and white surfaces retain full HD detail.
-          3. Anchors black level so extra brightness never turns shadows into gray haze.
-        """
-        eff_target = 0.44 + 0.14 * light_boost + 0.05 * exposure_ev
-        target_lum = float(np.clip(eff_target, 0.35, 0.72))
+        """Highlight-safe LIME/Retinex illumination & rational exposure tone curve in float32."""
+        eff_target = float(np.clip(0.44 + 0.14 * light_boost + 0.05 * exposure_ev, 0.35, 0.72))
         scene_level = float(0.65 * np.mean(illum) + 0.35 * np.percentile(illum, 65))
-        if scene_level >= target_lum:
+        if scene_level >= eff_target:
             auto_gamma = float(np.clip(0.95 - 0.12 * light_boost, 0.68, 1.0))
         else:
-            auto_gamma = float(
-                np.clip(np.log(target_lum) / np.log(max(scene_level, 0.025)), 0.18, 0.92)
-            )
+            auto_gamma = float(np.clip(np.log(eff_target) / np.log(max(scene_level, 0.025)), 0.18, 0.92))
 
-        t_enh = np.power(illum, auto_gamma)
-        max_gain = 2.0 + 9.5 * shadow_lift
-        gain = np.clip(t_enh / np.maximum(illum, 0.015), 1.0, max_gain)
+        t_enh = np.power(illum, np.float32(auto_gamma))
+        max_gain = 2.0 + 9.0 * shadow_lift
+        gain = np.clip(t_enh / np.maximum(illum, np.float32(0.02)), 1.0, max_gain).astype(np.float32)
+        lifted = np.clip(img_f * gain[:, :, None], 0.0, 1.0).astype(np.float32)
 
-        lifted = np.clip(img_f * gain[:, :, None], 0.0, 1.0)
-
-        # Gentle shadow recovery strictly in deepest shadows (illum < 0.30)
         if shadow_lift > 0:
-            k_log = 3.5 + 4.5 * shadow_lift
+            k_log = 3.5 + 4.0 * shadow_lift
             log_boost = np.log1p(k_log * img_f) / np.log1p(k_log)
-            dark_mask = np.clip((0.30 - illum) / 0.30, 0.0, 1.0)[:, :, None] ** 1.6
-            lifted = lifted * (1.0 - 0.25 * dark_mask) + log_boost * (0.25 * dark_mask)
+            dark_mask = (np.clip((np.float32(0.30) - illum) / np.float32(0.30), 0.0, 1.0)[:, :, None] ** 1.6).astype(np.float32)
+            lifted = (lifted * (np.float32(1.0) - np.float32(0.22) * dark_mask) + log_boost * (np.float32(0.22) * dark_mask)).astype(np.float32)
 
-        # Rational luminance curve (0->0, 1->1, lifts darks/mids cleanly with ZERO highlight blowout!)
         if exposure_ev > 0.01:
-            k_exp = 0.65 * exposure_ev
-            lum = np.clip(
-                0.299 * lifted[:, :, 0] + 0.587 * lifted[:, :, 1] + 0.114 * lifted[:, :, 2],
-                1e-4,
-                1.0,
-            )
-            lum_new = (1.0 + k_exp) * lum / (1.0 + k_exp * lum)
-            ratio = np.clip(lum_new / lum, 1.0, 1.0 + k_exp)
-            lifted = np.clip(lifted * ratio[:, :, None], 0.0, 1.0)
+            k_exp = np.float32(0.65 * exposure_ev)
+            lum = np.clip(_luma_f32(lifted), 1e-4, 1.0).astype(np.float32)
+            lum_new = (np.float32(1.0) + k_exp) * lum / (np.float32(1.0) + k_exp * lum)
+            ratio = np.clip(lum_new / lum, 1.0, float(1.0 + k_exp))[:, :, None].astype(np.float32)
+            lifted = np.clip(lifted * ratio, 0.0, 1.0).astype(np.float32)
 
-        # Black-point dehaze anchor: keep blacks crisp instead of milky fog at high light boost
-        lum_cur = 0.299 * lifted[:, :, 0] + 0.587 * lifted[:, :, 1] + 0.114 * lifted[:, :, 2]
-        p_black = float(np.percentile(lum_cur, 0.5))
-        if p_black > 0.03:
-            haze_shift = min((p_black - 0.012) * 0.70, 0.07)
-            lifted = np.clip((lifted - haze_shift) / max(1.0 - haze_shift, 0.85), 0.0, 1.0)
+        return np.clip(lifted, 0.0, 1.0).astype(np.float32)
 
-        return np.clip(lifted, 0.0, 1.0)
-
-    def _clahe_l(self, img_rgb: np.ndarray, clip_limit: float = 2.5) -> np.ndarray:
-        """Apply CLAHE strictly on LAB Luminance channel so hue/color never drifts."""
-        if clip_limit <= 0.1:
-            return img_rgb
-        try:
-            import cv2
-            lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
-            clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-            lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-            return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-        except ImportError:
-            # PIL fallback: stretch luminance percentiles cleanly
-            img_f = img_rgb.astype(np.float32) / 255.0
-            lum = 0.299 * img_f[:, :, 0] + 0.587 * img_f[:, :, 1] + 0.114 * img_f[:, :, 2]
-            p_lo, p_hi = np.percentile(lum, 1), np.percentile(lum, 99.5)
-            scale = np.clip((lum - p_lo) / max(p_hi - p_lo, 1e-4), 0.0, 1.0) / (lum + 1e-4)
-            out = np.clip(img_f * scale[:, :, None], 0.0, 1.0)
-            return (out * 255.0).round().astype(np.uint8)
-
-    def _denoise(
-        self, img_u8: np.ndarray, illum: np.ndarray | None = None, light_boost: float = 0.85
-    ) -> np.ndarray:
-        """
-        Gain-Adaptive Clean-Edge Denoiser:
-          1. Scales shadow noise removal smoothly when Light Boost amplifies dark sensor grain.
-          2. Computes structural Sobel edges AFTER initial NLM pass so amplified noise specks
-             are never mistaken for edges, while keeping bright crisp foreground subjects sharper.
-        """
-        try:
-            import cv2
-            h_lum = float(np.clip(4.0 + 1.8 * max(light_boost - 0.6, 0.0), 3.5, 7.0))
-            dn = cv2.fastNlMeansDenoisingColored(
-                img_u8, None, h=h_lum, hColor=10.0, templateWindowSize=5, searchWindowSize=13
-            )
-            # Compute edge mask on denoised luminance so sensor speckles do not pass through
-            gray_dn = cv2.cvtColor(dn, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-            gx = cv2.Sobel(gray_dn, cv2.CV_32F, 1, 0, ksize=3)
-            gy = cv2.Sobel(gray_dn, cv2.CV_32F, 0, 1, ksize=3)
-            true_edge = np.clip(np.hypot(gx, gy) * 2.5 - 0.08, 0.0, 0.65)
-            # Only restore high-freq details in well-lit pixels / crisp true edges, keep dark walls silky clean
-            if illum is not None:
-                lit_weight = np.clip(illum * 1.4, 0.20, 1.0)
-                keep_orig = (true_edge * lit_weight)[:, :, None]
-            else:
-                keep_orig = true_edge[:, :, None]
-            out = dn.astype(np.float32) * (1.0 - keep_orig) + img_u8.astype(np.float32) * keep_orig
-            return np.clip(out, 0, 255).round().astype(np.uint8)
-        except ImportError:
-            return img_u8
-
-    def _white_balance_soft(self, img_f: np.ndarray, strength: float = 0.35) -> np.ndarray:
+    def _white_balance_soft(self, img_f: np.ndarray, strength: float = 0.08) -> np.ndarray:
         """Soft gray-world white balance so natural ambient lighting stays realistic."""
         m_r, m_g, m_b = img_f[:, :, 0].mean(), img_f[:, :, 1].mean(), img_f[:, :, 2].mean()
         avg = (m_r + m_g + m_b) / 3.0 + 1e-6
-        wb = np.stack([
-            img_f[:, :, 0] * (avg / (m_r + 1e-6)),
-            img_f[:, :, 1] * (avg / (m_g + 1e-6)),
-            img_f[:, :, 2] * (avg / (m_b + 1e-6)),
-        ], axis=-1)
-        wb = np.clip(wb, 0.0, 1.0)
-        return np.clip((1.0 - strength) * img_f + strength * wb, 0.0, 1.0)
+        wb = np.clip(
+            np.stack(
+                [
+                    img_f[:, :, 0] * (avg / (m_r + 1e-6)),
+                    img_f[:, :, 1] * (avg / (m_g + 1e-6)),
+                    img_f[:, :, 2] * (avg / (m_b + 1e-6)),
+                ],
+                axis=-1,
+            ),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        return np.clip((1.0 - strength) * img_f + strength * wb, 0.0, 1.0).astype(np.float32)
 
-    def _hd_clarity_and_color(
+    def _denoise_float(
         self,
         img_f: np.ndarray,
-        clarity: float = 0.40,
-        saturation: float = 1.15,
+        illum: np.ndarray,
+        res_sc: float,
+        noise_est: float,
         light_boost: float = 0.85,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Noise-adaptive YCrCb denoiser: wide chroma cleaning + NLM + guided flat polish."""
+        try:
+            import cv2
+            yc = cv2.cvtColor(img_f.astype(np.float32, copy=False), cv2.COLOR_RGB2YCrCb)
+            sig_c = 2.0 * res_sc if noise_est > 0.015 else 1.2 * res_sc
+            yc[:, :, 1] = cv2.GaussianBlur(yc[:, :, 1], (0, 0), sigmaX=sig_c)
+            yc[:, :, 2] = cv2.GaussianBlur(yc[:, :, 2], (0, 0), sigmaX=sig_c)
+            yc[:, :, 1] = cv2.bilateralFilter(yc[:, :, 1], d=5, sigmaColor=0.06, sigmaSpace=1.5 * res_sc)
+            yc[:, :, 2] = cv2.bilateralFilter(yc[:, :, 2], d=5, sigmaColor=0.06, sigmaSpace=1.5 * res_sc)
+
+            y_u8 = np.clip(yc[:, :, 0] * 255.0, 0, 255).round().astype(np.uint8)
+            h_nlm = float(np.clip(3.2 + 240.0 * noise_est + 1.8 * max(light_boost - 0.8, 0.0), 3.0, 15.0))
+            y_nlm = (
+                cv2.fastNlMeansDenoising(y_u8, None, h=h_nlm, templateWindowSize=7, searchWindowSize=15).astype(np.float32)
+                / np.float32(255.0)
+            )
+            r_sm = max(3, int(round(3.5 * res_sc)))
+            y_smooth = _guided_filter_f32(y_nlm, y_nlm, radius=r_sm, eps=0.004 + 0.25 * noise_est)
+
+            edge_c = _edge_confidence(
+                y_smooth, sigma=max(1.0, 0.9 * res_sc), gain=4.2, threshold=0.03 + 0.7 * noise_est
+            )
+            flat_mix = np.clip((np.float32(0.55) - illum) / np.float32(0.55), 0.35, 0.95).astype(np.float32)
+            one_minus_edge = (np.float32(1.0) - edge_c).astype(np.float32)
+            base_w = np.maximum(flat_mix * one_minus_edge, np.float32(0.35)).astype(np.float32)
+            y_flat = (y_nlm * (np.float32(1.0) - np.float32(0.65) * one_minus_edge) + y_smooth * (np.float32(0.65) * one_minus_edge)).astype(np.float32)
+            y_clean = (yc[:, :, 0] * (np.float32(1.0) - base_w) + y_flat * base_w).astype(np.float32)
+
+            # In noisy photos, let true edges come from mosquito-free NLM instead of raw sensor specks
+            raw_edge_keep = np.float32(0.65) if noise_est <= 0.012 else np.float32(0.15)
+            edge_src = yc[:, :, 0] * raw_edge_keep + y_nlm * (np.float32(1.0) - raw_edge_keep)
+            yc[:, :, 0] = np.clip(edge_src * (edge_c * np.float32(0.65)) + y_clean * (np.float32(1.0) - edge_c * np.float32(0.65)), 0.0, 1.0).astype(np.float32)
+            return np.clip(cv2.cvtColor(yc, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32), edge_c
+        except ImportError:
+            edge_c = _edge_confidence(_luma_f32(img_f))
+            return img_f, edge_c
+
+    def _clahe_l_float(self, img_f: np.ndarray, edge_c: np.ndarray, clip_limit: float = 1.6) -> np.ndarray:
+        """Apply smooth 16-bit CLAHE strictly on luminance and blend gently by edge confidence."""
+        if clip_limit <= 0.1:
+            return img_f
+        try:
+            import cv2
+            lum_f = np.clip(_luma_f32(img_f), 1e-4, 1.0).astype(np.float32)
+            y16 = np.clip(lum_f * 65535.0, 0, 65535).round().astype(np.uint16)
+            clahe = cv2.createCLAHE(clipLimit=max(1.0, min(float(clip_limit), 2.0)), tileGridSize=(4, 4))
+            y16_eq = clahe.apply(y16).astype(np.float32) / np.float32(65535.0)
+            cw = (np.float32(0.18) + np.float32(0.24) * edge_c).astype(np.float32)
+            y_eq = (lum_f * (np.float32(1.0) - cw) + y16_eq * cw).astype(np.float32)
+            ratio = np.clip(y_eq / (lum_f + np.float32(1e-4)), 0.84, 1.30)[:, :, None].astype(np.float32)
+            return np.clip(img_f * ratio, 0.0, 1.0).astype(np.float32)
+        except ImportError:
+            return img_f
+
+    def _tone_and_color(
+        self,
+        img_f: np.ndarray,
+        saturation: float = 1.15,
         warmth: float = 0.0,
         contrast: float = 0.14,
     ) -> np.ndarray:
-        """
-        Clean Structural HD Clarity + Halo-Free Edge Enhancement:
-          - Extracts clean local structure via GuidedFilter (eliminates brightness haze cleanly).
-          - Enhances crisp edges weighted by denoised Sobel edges so high brightness looks HD sharp
-            with silky-smooth walls (zero sandy noise!).
-        """
-        if clarity > 0.01:
-            lum = (0.299 * img_f[:, :, 0] + 0.587 * img_f[:, :, 1] + 0.114 * img_f[:, :, 2]).astype(np.float32)
-
-            # Structural detail layer (de-veils brightness haze smoothly)
-            base_struct = self._guided_filter_gray(lum, lum, radius=6, eps=0.025)
-            d_struct = lum - base_struct
-            d_struct_clean = np.sign(d_struct) * np.maximum(np.abs(d_struct) - 0.008, 0.0)
-
-            # Edge-only fine crispness computed cleanly without amplifying flat-wall noise
-            try:
-                import cv2
-                fine_blur = cv2.GaussianBlur(lum, (0, 0), sigmaX=0.85)
-                sm = cv2.GaussianBlur(lum, (5, 5), 1.0)
-                gx = cv2.Sobel(sm, cv2.CV_32F, 1, 0, ksize=3)
-                gy = cv2.Sobel(sm, cv2.CV_32F, 0, 1, ksize=3)
-                edge_weight = np.clip(np.hypot(gx, gy) * 3.0 - 0.10, 0.0, 1.0)
-            except ImportError:
-                fine_blur = lum
-                edge_weight = np.zeros_like(lum)
-            d_fine = (lum - fine_blur) * edge_weight
-
-            eff_clarity = clarity * (1.0 + 0.15 * max(light_boost - 0.8, 0.0))
-            lum_hd = np.clip(lum + eff_clarity * (0.75 * d_struct_clean + 0.55 * d_fine), 0.0, 1.0)
-            ratio = np.clip((lum_hd + 1e-4) / (lum + 1e-4), 0.78, 1.35)
-            img_f = np.clip(img_f * ratio[:, :, None], 0.0, 1.0)
-
+        """Apply shadow-protected midtone S-curve contrast, warmth shift, and smart vibrance."""
         if abs(contrast) > 0.01:
-            # Subtle filmic S-curve deepens shadows softly & boosts rich punch without clipping
-            s_curve = 0.5 - 0.5 * np.cos(np.pi * np.clip(img_f, 0.0, 1.0))
-            img_f = np.clip((1.0 - contrast) * img_f + contrast * s_curve, 0.0, 1.0)
+            lum_c = np.clip(_luma_f32(img_f), 1e-4, 1.0).astype(np.float32)
+            s_c = np.float32(0.5) - np.float32(0.5) * np.cos(np.float32(np.pi) * lum_c)
+            prot = np.clip((lum_c - np.float32(0.05)) / np.float32(0.18), 0.0, 1.0).astype(np.float32)
+            lum_sc = (lum_c * (np.float32(1.0) - np.float32(contrast) * prot) + s_c * (np.float32(contrast) * prot)).astype(np.float32)
+            ratio = np.clip(lum_sc / (lum_c + np.float32(1e-4)), 0.82, 1.24)[:, :, None].astype(np.float32)
+            img_f = np.clip(img_f * ratio, 0.0, 1.0).astype(np.float32)
 
         if abs(warmth) > 0.01:
-            # Luminance-preserving White-Balance temperature shift (-cool moonlight <-> +warm tungsten)
-            w_r = 1.0 + 0.28 * warmth
-            w_b = 1.0 - 0.28 * warmth
-            lum_before = 0.299 * img_f[:, :, 0] + 0.587 * img_f[:, :, 1] + 0.114 * img_f[:, :, 2]
-            warmed = np.stack([img_f[:, :, 0] * w_r, img_f[:, :, 1], img_f[:, :, 2] * w_b], axis=-1)
-            lum_after = 0.299 * warmed[:, :, 0] + 0.587 * warmed[:, :, 1] + 0.114 * warmed[:, :, 2] + 1e-5
-            img_f = np.clip(warmed * ((lum_before + 1e-5) / lum_after)[:, :, None], 0.0, 1.0)
+            w_r, w_b = np.float32(1.0 + 0.28 * warmth), np.float32(1.0 - 0.28 * warmth)
+            lb = _luma_f32(img_f)
+            warmed = np.stack([img_f[:, :, 0] * w_r, img_f[:, :, 1], img_f[:, :, 2] * w_b], axis=-1).astype(np.float32)
+            la = _luma_f32(warmed) + np.float32(1e-5)
+            img_f = np.clip(warmed * ((lb + np.float32(1e-5)) / la)[:, :, None], 0.0, 1.0).astype(np.float32)
 
         if abs(saturation - 1.0) > 0.01:
-            # Smart Saturation/Vibrance: lifts muted shadows gently without oversaturating bright neons
             mx = np.max(img_f, axis=2, keepdims=True)
             mn = np.min(img_f, axis=2, keepdims=True)
-            cur_sat = (mx - mn) / np.maximum(mx, 1e-4)
-            vib_factor = 1.0 + (saturation - 1.0) * (1.0 - 0.45 * cur_sat)
-            gray_px = (0.299 * img_f[:, :, 0] + 0.587 * img_f[:, :, 1] + 0.114 * img_f[:, :, 2])[:, :, None]
-            img_f = np.clip(gray_px + (img_f - gray_px) * vib_factor, 0.0, 1.0)
-        return np.clip(img_f, 0.0, 1.0)
+            cur_sat = (mx - mn) / np.maximum(mx, np.float32(1e-4))
+            vib = (np.float32(1.0) + np.float32(saturation - 1.0) * (np.float32(1.0) - np.float32(0.45) * cur_sat)).astype(np.float32)
+            g = _luma_f32(img_f)[:, :, None]
+            img_f = np.clip(g + (img_f - g) * vib, 0.0, 1.0).astype(np.float32)
+
+        return np.clip(img_f, 0.0, 1.0).astype(np.float32)
 
     def enhance(
         self,
@@ -285,57 +336,50 @@ class ClassicalEnhancer:
         warmth: float = 0.0,
         contrast: float = 0.14,
         gamma: Optional[float] = None,
+        apply_sharpen: bool = True,
     ) -> dict:
-        """Run full HD-clarity + Fill-Light + Warmth/Contrast low-light enhancement pipeline."""
+        """Run float32 HD-clarity + Fill-Light + Noise-Adaptive low-light enhancement pipeline."""
         if gamma is not None:
             light_boost = float(np.clip((0.85 - gamma) * 2.2, 0.0, 2.0))
         t0 = time.perf_counter()
         img_u8 = np.array(pil_img.convert("RGB"), dtype=np.uint8)
-        img_f  = img_u8.astype(np.float32) / 255.0
+        img_f = (img_u8.astype(np.float32) / np.float32(255.0))
+        h0, w0 = img_f.shape[:2]
+        res_sc = min(max(max(h0, w0) / 480.0, 1.0), 3.0)
 
-        # 1. Estimate smooth illumination map L(x)
         illum = self._estimate_illumination(img_f)
+        clean_f = self._pre_denoise_float(img_f, illum, res_sc) if denoise else img_f
 
-        # 2. Retinex illumination-guided brightness, shadow lift & photographic fill-light
         lifted_f = self._retinex_lift(
-            img_f,
-            illum,
-            shadow_lift=shadow_lift,
-            light_boost=light_boost,
-            exposure_ev=exposure_ev,
+            clean_f, illum, shadow_lift=shadow_lift, light_boost=light_boost, exposure_ev=exposure_ev
         )
-
-        # 3. Very gentle white balance
         wb_f = self._white_balance_soft(lifted_f, strength=0.08)
-        wb_u8 = (np.clip(wb_f, 0, 1) * 255).round().astype(np.uint8)
 
-        # 4. Gain-adaptive clean-edge denoising (cleans boosted shadow noise without blunting crisp edges)
+        lum_pre = _luma_f32(wb_f)
+        noise_est = _estimate_noise_mad(lum_pre)
         if denoise:
-            wb_u8 = self._denoise(wb_u8, illum=illum, light_boost=light_boost)
+            dn_f, edge_c = self._denoise_float(wb_f, illum, res_sc, noise_est, light_boost=light_boost)
+        else:
+            dn_f = wb_f
+            edge_c = _edge_confidence(lum_pre)
 
-        # 5. CLAHE on LAB L-channel for local dynamic range
-        clahe_u8 = self._clahe_l(wb_u8, clip_limit=clahe_clip)
+        clahe_f = self._clahe_l_float(dn_f, edge_c, clip_limit=clahe_clip)
+        toned_f = self._tone_and_color(clahe_f, saturation=saturation, warmth=warmth, contrast=contrast)
+        res_noise = _estimate_noise_mad(_luma_f32(toned_f))
 
-        # 6. Multi-scale Guided HD Clarity + filmic contrast + warmth + smart vibrance
-        final_f = self._hd_clarity_and_color(
-            clahe_u8.astype(np.float32) / 255.0,
-            clarity=clarity,
-            saturation=saturation,
-            light_boost=light_boost,
-            warmth=warmth,
-            contrast=contrast,
-        )
+        final_f = _apply_hd_clarity_tanh(toned_f, clarity=clarity, scale_factor=1.0, noise_level=res_noise) if apply_sharpen else toned_f
         t1 = time.perf_counter()
 
         illum_u8 = (np.clip(illum, 0, 1) * 255).round().astype(np.uint8)
-        enh_pil  = Image.fromarray((np.clip(final_f, 0, 1) * 255).round().astype(np.uint8))
+        enh_pil = Image.fromarray((np.clip(final_f, 0, 1) * 255).round().astype(np.uint8))
 
         return {
             "enhanced_pil": enh_pil,
-            "illum_arr":    illum_u8,
-            "infer_ms":     (t1 - t0) * 1000.0,
+            "illum_arr": illum_u8,
+            "infer_ms": (t1 - t0) * 1000.0,
             "total_params": 0,
-            "loaded_ckpt":  "Retinex+CLAHE+HD Pipeline",
+            "loaded_ckpt": "Retinex+CLAHE+HD Pipeline",
+            "noise_level": res_noise,
         }
 
 
@@ -1083,13 +1127,20 @@ def resize_for_processing(pil: Image.Image, max_side: int) -> Image.Image:
     )
 
 
-def upscale_to_hd_crisp(pil: Image.Image, target_long_side: int = 1920) -> Image.Image:
-    """Upscale smaller images cleanly to target HD/4K resolution using progressive
-    Lanczos4 pyramid + bilateral edge de-staircasing + edge-gated Y-channel micro-clarity.
+def upscale_to_hd_crisp(
+    pil: Image.Image,
+    target_long_side: int = 1920,
+    clarity: float = 0.40,
+    noise_level: Optional[float] = None,
+) -> Image.Image:
+    """Upscale images cleanly to HD/4K without Lanczos ringing, grid tearing, or blur.
+
+    Uses gentle scale-adaptive pre-anti-aliasing for large magnifications (>2x),
+    continuous Bicubic resampling, and a single halo-free tanh-bounded HD edge pass.
     """
     w, h = pil.size
     long_side = max(w, h)
-    if long_side >= target_long_side:
+    if target_long_side <= 0 or long_side >= target_long_side:
         return pil
 
     target_scale = target_long_side / float(long_side)
@@ -1097,41 +1148,27 @@ def upscale_to_hd_crisp(pil: Image.Image, target_long_side: int = 1920) -> Image
 
     try:
         import cv2
-        cur = np.array(pil.convert("RGB"), dtype=np.uint8)
-        cur_w, cur_h = w, h
+        arr_f = np.array(pil.convert("RGB"), dtype=np.float32) / np.float32(255.0)
+        nl = _estimate_noise_mad(_luma_f32(arr_f)) if noise_level is None else float(noise_level)
 
-        # Step up progressively (max 2x per stage) with Lanczos4 interpolation to minimize ringing
-        while max(cur_w, cur_h) * 2.0 < target_long_side:
-            cur_w *= 2
-            cur_h *= 2
-            cur = cv2.resize(cur, (cur_w, cur_h), interpolation=cv2.INTER_LANCZOS4)
-        cur = cv2.resize(cur, target_size, interpolation=cv2.INTER_LANCZOS4)
+        # Gently relax discrete pixel grid corners on >2x zooms so diagonal contours stay silky smooth
+        if target_scale > 3.5:
+            arr_f = cv2.GaussianBlur(arr_f, (0, 0), sigmaX=0.38)
+        elif target_scale > 2.0:
+            arr_f = cv2.GaussianBlur(arr_f, (0, 0), sigmaX=0.20)
 
-        # Smooth diagonal staircase jaggies along contours while tightening crisp edges
-        de_jag = cv2.bilateralFilter(cur, d=5, sigmaColor=16, sigmaSpace=3)
+        pre_u8 = np.clip(arr_f * 255.0, 0, 255).round().astype(np.uint8)
+        up_pil = Image.fromarray(pre_u8).resize(target_size, Image.BICUBIC)
+        up_f = np.array(up_pil, dtype=np.float32) / np.float32(255.0)
 
-        # Edge-gated 4K Y-channel micro-detail crispness (zero color shift, flat regions stay clean)
-        ycrcb = cv2.cvtColor(de_jag, cv2.COLOR_RGB2YCrCb)
-        y_u8, cr, cb = cv2.split(ycrcb)
-        y_f = y_u8.astype(np.float32) / 255.0
-
-        blur_fine = cv2.GaussianBlur(y_f, (0, 0), sigmaX=1.05)
-        blur_med = cv2.GaussianBlur(y_f, (0, 0), sigmaX=2.60)
-        blur_edge = cv2.GaussianBlur(y_f, (5, 5), 1.2)
-        gx = cv2.Sobel(blur_edge, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(blur_edge, cv2.CV_32F, 0, 1, ksize=3)
-        edge_gate = np.clip(np.hypot(gx, gy) * 3.5 - 0.05, 0.08, 1.0)
-
-        detail_4k = (0.55 * (y_f - blur_fine) + 0.35 * (y_f - blur_med)) * edge_gate
-        y_4k = np.clip(y_f + detail_4k, 0.0, 1.0)
-        y_4k_u8 = (y_4k * 255.0).round().astype(np.uint8)
-
-        out_rgb = cv2.cvtColor(cv2.merge([y_4k_u8, cr, cb]), cv2.COLOR_YCrCb2RGB)
-        return Image.fromarray(out_rgb)
+        hd_f = _apply_hd_clarity_tanh(
+            up_f, clarity=clarity, scale_factor=target_scale, noise_level=nl
+        )
+        return Image.fromarray((np.clip(hd_f, 0, 1) * 255.0).round().astype(np.uint8))
     except ImportError:
         from PIL import ImageFilter
-        up = pil.resize(target_size, Image.LANCZOS)
-        return up.filter(ImageFilter.UnsharpMask(radius=1.2, percent=85, threshold=2))
+        up = pil.resize(target_size, Image.BICUBIC)
+        return up.filter(ImageFilter.UnsharpMask(radius=1.2, percent=75, threshold=3))
 
 
 def pil_to_bytes(pil: Image.Image, fmt="PNG") -> bytes:
@@ -1250,6 +1287,7 @@ def run_inference_cached(
     # Keep FULL native resolution up to 4096px in Classical/Auto unless user disables Preserve Full HD
     if effective_mode == "classical":
         proc = resize_for_processing(pil, 4096) if full_res else resize_for_processing(pil, max_side)
+        will_upscale = target_px > 0 and max(proc.size) < target_px
         result = _classical_enhancer.enhance(
             proc,
             light_boost=light_boost,
@@ -1261,11 +1299,15 @@ def run_inference_cached(
             clarity=clarity,
             warmth=warmth,
             contrast=contrast,
+            apply_sharpen=not will_upscale,
         )
         t_up0 = time.perf_counter()
-        if target_px > 0 and max(result["enhanced_pil"].size) < target_px:
+        if will_upscale:
             result["enhanced_pil"] = upscale_to_hd_crisp(
-                result["enhanced_pil"], target_long_side=target_px
+                result["enhanced_pil"],
+                target_long_side=target_px,
+                clarity=clarity,
+                noise_level=result.get("noise_level"),
             )
         t_up1 = time.perf_counter()
         result["infer_ms"] += (t_up1 - t_up0) * 1000.0
@@ -1848,7 +1890,9 @@ def tab_single(config, ckpt_path, device_str, max_side, save_to_disk, tune):
                     width="stretch",
                 )
             if max(enh_pil.size) < 3840:
-                uhd_pil = upscale_to_hd_crisp(enh_pil, target_long_side=3840)
+                uhd_pil = upscale_to_hd_crisp(
+                    enh_pil, target_long_side=3840, clarity=min(0.28, tune["clarity"])
+                )
                 st.download_button(
                     f"⬇️ Download 4K UHD Upscaled PNG ({uhd_pil.size[0]}×{uhd_pil.size[1]})",
                     data=pil_to_bytes(uhd_pil, fmt="PNG"),
