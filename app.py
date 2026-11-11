@@ -111,6 +111,29 @@ def _edge_confidence(lum_f: np.ndarray, sigma: float = 0.8, gain: float = 5.0, t
         return np.zeros_like(lum_f, dtype=np.float32)
 
 
+def _richardson_lucy_y(
+    lum_f: np.ndarray, sigma: float = 0.58, n_iter: int = 2, noise_level: float = 0.01
+) -> np.ndarray:
+    """Fast edge-gated Richardson-Lucy luminance deconvolution for optical lens softness."""
+    if n_iter <= 0:
+        return lum_f
+    try:
+        import cv2
+        y = np.clip(lum_f.astype(np.float32, copy=False), 0.01, 1.0).astype(np.float32)
+        est = y.copy()
+        gate = _edge_confidence(y, sigma=0.72, gain=5.2, threshold=0.025 + 2.0 * noise_level)
+        sig = max(float(sigma), 0.35)
+        for _ in range(int(n_iter)):
+            conv = np.maximum(cv2.GaussianBlur(est, (0, 0), sigmaX=sig), np.float32(1e-3))
+            ratio = y / conv
+            upd = est * cv2.GaussianBlur(ratio, (0, 0), sigmaX=sig)
+            diff = np.float32(0.05) * np.tanh((upd - est) / np.float32(0.05))
+            est = np.clip(est + diff * gate, 0.0, 1.0).astype(np.float32)
+        return est
+    except ImportError:
+        return lum_f
+
+
 def _apply_hd_clarity_tanh(
     img_f: np.ndarray,
     clarity: float = 0.40,
@@ -390,6 +413,7 @@ class ClassicalEnhancer:
         contrast: float = 0.14,
         gamma: Optional[float] = None,
         apply_sharpen: bool = True,
+        rl_iters: int = 0,
     ) -> dict:
         """Run float32 HD-clarity + Fill-Light + Noise-Adaptive low-light enhancement pipeline."""
         if gamma is not None:
@@ -441,7 +465,16 @@ class ClassicalEnhancer:
         )
         res_noise = _estimate_noise_mad(_luma_f32(toned_f))
 
-        final_f = _apply_hd_clarity_tanh(toned_f, clarity=clarity, scale_factor=1.0, noise_level=res_noise) if apply_sharpen else toned_f
+        if apply_sharpen:
+            if rl_iters > 0 and clarity > 0.05:
+                y_sh = np.clip(_luma_f32(toned_f), 1e-4, 1.0).astype(np.float32)
+                y_deb = _richardson_lucy_y(y_sh, sigma=0.58, n_iter=rl_iters, noise_level=res_noise)
+                toned_f = np.clip(
+                    toned_f * np.clip(y_deb / (y_sh + np.float32(1e-4)), 0.84, 1.20)[:, :, None], 0.0, 1.0
+                ).astype(np.float32)
+            final_f = _apply_hd_clarity_tanh(toned_f, clarity=clarity, scale_factor=1.0, noise_level=res_noise)
+        else:
+            final_f = toned_f
         t1 = time.perf_counter()
 
         illum_u8 = (np.clip(illum, 0, 1) * 255).round().astype(np.uint8)
@@ -982,14 +1015,14 @@ def make_split_comparison(
 
 def _pil_to_data_uri(pil: Image.Image) -> str:
     buf = io.BytesIO()
-    pil.save(buf, format="JPEG", quality=92)
+    pil.save(buf, format="JPEG", quality=96, subsampling=0)
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:image/jpeg;base64,{b64}"
 
 
 def render_curtain_comparator(orig_pil: Image.Image, enh_pil: Image.Image, res_tag: str = "4K UHD"):
     """Render a smooth 60fps mouse/touch draggable Before/After curtain comparator via HTML5/CSS/JS."""
-    disp_enh = resize_for_display(enh_pil, 1280)
+    disp_enh = resize_for_display(enh_pil, 1920)
     disp_orig = orig_pil.resize(disp_enh.size, Image.LANCZOS)
     w, h = disp_enh.size
     aspect_pct = max(35.0, min(85.0, (h / max(w, 1)) * 100.0))
@@ -1067,7 +1100,7 @@ def render_curtain_comparator(orig_pil: Image.Image, enh_pil: Image.Image, res_t
 
 def render_loupe_inspector(orig_pil: Image.Image, enh_pil: Image.Image):
     """60fps interactive 3.0x circular magnifying lens for inspecting 4K clarity."""
-    disp_enh = resize_for_display(enh_pil, 1600)
+    disp_enh = resize_for_display(enh_pil, 2560)
     w, h = disp_enh.size
     enh_uri = _pil_to_data_uri(disp_enh)
     approx_px = int(min(620, max(360, 900 * (h / max(w, 1)) + 20)))
@@ -1206,11 +1239,11 @@ def upscale_to_hd_crisp(
     target_long_side: int = 1920,
     clarity: float = 0.40,
     noise_level: Optional[float] = None,
+    rl_iters: int = 2,
+    n_ibp: int = 2,
 ) -> Image.Image:
-    """Upscale images cleanly to HD/4K with zero source pre-blur, ringing, or grid tearing.
-
-    Uses continuous Bicubic resampling followed by a single scale- and noise-adaptive
-    halo-free tanh-bounded HD edge tightening pass at target resolution.
+    """Upscale images cleanly to HD/4K via Richardson-Lucy optical de-blur and
+    progressive 2x Iterative Back-Projection (IBP) super-sampling.
     """
     w, h = pil.size
     long_side = max(w, h)
@@ -1221,12 +1254,51 @@ def upscale_to_hd_crisp(
     target_size = (max(8, int(round(w * target_scale))), max(8, int(round(h * target_scale))))
 
     try:
-        up_pil = pil.convert("RGB").resize(target_size, Image.BICUBIC)
-        up_f = np.array(up_pil, dtype=np.float32) / np.float32(255.0)
-        nl = _estimate_noise_mad(_luma_f32(up_f)) if noise_level is None else float(noise_level)
+        import cv2
+        cur = np.array(pil.convert("RGB"), dtype=np.float32) / np.float32(255.0)
+        nl = _estimate_noise_mad(_luma_f32(cur)) if noise_level is None else float(noise_level)
+
+        if rl_iters > 0 and clarity > 0.05:
+            y0 = np.clip(_luma_f32(cur), 1e-4, 1.0).astype(np.float32)
+            y_deblur = _richardson_lucy_y(y0, sigma=0.58, n_iter=rl_iters, noise_level=nl)
+            cur = np.clip(cur * np.clip(y_deblur / (y0 + np.float32(1e-4)), 0.84, 1.20)[:, :, None], 0.0, 1.0).astype(np.float32)
+
+        if n_ibp > 0:
+            cw, ch = w, h
+            tw, th = target_size
+            while max(cw, ch) < target_long_side:
+                prev = cur
+                pw, ph = cw, ch
+                if max(cw, ch) * 2.0 < target_long_side:
+                    cw *= 2
+                    ch *= 2
+                else:
+                    cw, ch = tw, th
+
+                up_pil = Image.fromarray((np.clip(prev, 0, 1) * 255.0).round().astype(np.uint8)).resize(
+                    (cw, ch), Image.BICUBIC
+                )
+                cur = np.array(up_pil, dtype=np.float32) / np.float32(255.0)
+
+                y_prev_ref = _luma_f32(prev)
+                y_cur = np.clip(_luma_f32(cur), 1e-4, 1.0).astype(np.float32)
+                step_iters = n_ibp if max(cw, ch) <= 2048 else 1
+                for _ in range(step_iters):
+                    y_down = cv2.resize(y_cur, (pw, ph), interpolation=cv2.INTER_AREA)
+                    err_lr = (y_prev_ref - y_down).astype(np.float32)
+                    err_hr = cv2.resize(err_lr, (cw, ch), interpolation=cv2.INTER_CUBIC)
+                    y_cur = np.clip(y_cur + np.float32(0.65) * err_hr, 0.0, 1.0).astype(np.float32)
+
+                ratio = np.clip(y_cur / (_luma_f32(cur) + np.float32(1e-4)), 0.80, 1.25)[:, :, None].astype(np.float32)
+                cur = np.clip(cur * ratio, 0.0, 1.0).astype(np.float32)
+        else:
+            up_pil = Image.fromarray((np.clip(cur, 0, 1) * 255.0).round().astype(np.uint8)).resize(
+                target_size, Image.BICUBIC
+            )
+            cur = np.array(up_pil, dtype=np.float32) / np.float32(255.0)
 
         hd_f = _apply_hd_clarity_tanh(
-            up_f, clarity=clarity, scale_factor=target_scale, noise_level=nl
+            cur, clarity=clarity, scale_factor=min(target_scale, 2.5), noise_level=nl
         )
         return Image.fromarray((np.clip(hd_f, 0, 1) * 255.0).round().astype(np.uint8))
     except ImportError:
@@ -1316,6 +1388,12 @@ OUTPUT_RES_MAP = {
     "Native Resolution": 0,
 }
 
+SUPER_SAMPLE_MAP = {
+    "HD Super-Sample (2× IBP + De-Blur)": (2, 2),
+    "Ultra 4× Super-Sample (Max HD)": (4, 3),
+    "Fast Standard (1× Bicubic)": (0, 0),
+}
+
 
 @st.cache_data(show_spinner=False)
 def run_inference_cached(
@@ -1336,10 +1414,12 @@ def run_inference_cached(
     contrast: float = 0.14,
     full_res: bool = True,
     output_res: str = "4K UHD (3840px Crisp)",
+    super_sample: str = "HD Super-Sample (2× IBP + De-Blur)",
 ) -> dict:
     """Cached inference so repeated clicks don't re-run."""
     pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     target_px = OUTPUT_RES_MAP.get(output_res, 3840)
+    rl_iters, n_ibp = SUPER_SAMPLE_MAP.get(super_sample, (2, 2))
 
     # Decide effective mode:
     # 'auto' uses trained deep checkpoint if provided; otherwise uses
@@ -1364,6 +1444,7 @@ def run_inference_cached(
             warmth=warmth,
             contrast=contrast,
             apply_sharpen=not will_upscale,
+            rl_iters=0 if will_upscale else rl_iters,
         )
         t_up0 = time.perf_counter()
         if will_upscale:
@@ -1372,6 +1453,8 @@ def run_inference_cached(
                 target_long_side=target_px,
                 clarity=clarity,
                 noise_level=result.get("noise_level"),
+                rl_iters=rl_iters,
+                n_ibp=n_ibp,
             )
         t_up1 = time.perf_counter()
         result["infer_ms"] += (t_up1 - t_up0) * 1000.0
@@ -1394,7 +1477,9 @@ def run_inference_cached(
         t1 = time.perf_counter()
     enh_pil = pil_from_tensor(out_dict["enhanced"])
     if target_px > 0 and max(enh_pil.size) < target_px:
-        enh_pil = upscale_to_hd_crisp(enh_pil, target_long_side=target_px)
+        enh_pil = upscale_to_hd_crisp(
+            enh_pil, target_long_side=target_px, rl_iters=rl_iters, n_ibp=n_ibp
+        )
     illum_arr = None
     if "illumination_map" in out_dict:
         illum = out_dict["illumination_map"].squeeze().cpu().numpy()
@@ -1564,7 +1649,13 @@ def render_sidebar():
             "🖥️ Output Target Resolution",
             options=list(OUTPUT_RES_MAP.keys()),
             index=0,
-            help="4K UHD upscales smaller images cleanly with edge-directed de-staircasing & 4K micro-detail.",
+            help="4K UHD upscales smaller images cleanly with progressive IBP super-sampling & micro-detail.",
+        )
+        super_sample = st.selectbox(
+            "🔬 HD Super-Sampling Pass",
+            options=list(SUPER_SAMPLE_MAP.keys()),
+            index=0,
+            help="Controls Richardson-Lucy lens de-blur & 2× Iterative Back-Projection (IBP) detail sampling.",
         )
         full_res = st.checkbox(
             "Preserve Original Camera Input (up to 4K)",
@@ -1613,6 +1704,7 @@ def render_sidebar():
         "denoise": denoise,
         "full_res": full_res,
         "output_res": output_res,
+        "super_sample": super_sample,
     }
     return config, ckpt_path, device_str, max_side, save_to_disk, tune
 
@@ -1735,6 +1827,7 @@ def tab_single(config, ckpt_path, device_str, max_side, save_to_disk, tune):
             contrast=tune["contrast"],
             full_res=tune["full_res"],
             output_res=tune["output_res"],
+            super_sample=tune["super_sample"],
         )
 
         if run_btn:
@@ -1869,7 +1962,16 @@ def tab_single(config, ckpt_path, device_str, max_side, save_to_disk, tune):
                     </div>""",
                     unsafe_allow_html=True,
                 )
-                st.image(resize_for_display(enh_pil, 1600), width="stretch")
+                st.image(resize_for_display(enh_pil, 2400), width="stretch")
+
+            if max(orig_pil.size) <= 500 and max(enh_pil.size) > max(orig_pil.size):
+                st.caption(
+                    f"ℹ️ Input image is {orig_pil.size[0]}×{orig_pil.size[1]} "
+                    f"({(orig_pil.size[0]*orig_pil.size[1])/1e6:.2f} MP) — upscaled to "
+                    f"{enh_pil.size[0]}×{enh_pil.size[1]} using **{tune['super_sample']}**. "
+                    "Switch to **Ultra 4× Super-Sample (Max HD)** in the sidebar for stronger edge de-blurring, "
+                    "or upload a ≥1080p source photo for native camera-grade 4K detail."
+                )
 
             if will_use_classical:
                 with st.expander("🎨 Compare All 3 Light Presets Side-by-Side", expanded=False):
@@ -2038,6 +2140,7 @@ def tab_batch(config, ckpt_path, device_str, max_side, save_to_disk, tune):
                 contrast=tune["contrast"],
                 full_res=tune["full_res"],
                 output_res=tune["output_res"],
+                super_sample=tune["super_sample"],
             )
             results.append({"name": f.name, "result": result})
 
