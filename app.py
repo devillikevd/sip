@@ -1470,22 +1470,36 @@ def upscale_to_hd_crisp(
             err_hr = cv2.resize(err_lr, (tw, th), interpolation=cv2.INTER_LANCZOS4)
             hr_arr = np.clip(hr_arr + np.float32(0.70) * err_hr, 0.0, 1.0).astype(np.float32)
 
-        # 5. High-precision 4K UHD micro-detail & sub-pixel edge sharpness (eliminates interpolation blur)
+        # 5. True 4K UHD High-Acutance Edge Steepening & Sub-Pixel Clarity (eliminates interpolation blur)
         y_up = _luma_f32(hr_arr)
-        g1 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=max(0.8, 0.45 * (target_scale ** 0.5)))
-        g2 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=max(1.8, 1.10 * (target_scale ** 0.5)))
-        detail_fine = (y_up - g1).astype(np.float32)
-        detail_med = (g1 - g2).astype(np.float32)
-
-        gx = cv2.Sobel(g1, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(g1, cv2.CV_32F, 0, 1, ksize=3)
+        gx = cv2.Sobel(y_up, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(y_up, cv2.CV_32F, 0, 1, ksize=3)
         grad = np.hypot(gx, gy)
-        edge_gate = _smoothstep_f32(0.005, 0.030, grad)
+        lap = cv2.Laplacian(y_up, cv2.CV_32F, ksize=3)
+
+        # Scale-aware shock steepening: compresses stretched Lanczos ramps back into crisp 4K transitions
+        shock_gain = np.float32(0.35 + 0.30 * clarity)
+        shock = -np.sign(lap) * np.minimum(grad * shock_gain, np.float32(0.065))
+
+        # 3-Octave Sub-Pixel Decomposition for camera-grade 4K texture acutance
+        g05 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=0.8)
+        g15 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=2.0)
+        g35 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=4.5)
+        d_subpixel = (y_up - g05).astype(np.float32)
+        d_fine = (g05 - g15).astype(np.float32)
+        d_med = (g15 - g35).astype(np.float32)
+
+        edge_gate = _smoothstep_f32(0.002, 0.020, grad)
+        dark_gate = _smoothstep_f32(0.015, 0.06, y_up)
+
+        w_sub = np.float32(1.30 + 0.80 * clarity)
+        w_fine = np.float32(0.85 + 0.50 * clarity)
+        w_med = np.float32(0.35 + 0.25 * clarity)
 
         sharp_delta = np.clip(
-            (np.float32(0.95 + 0.60 * clarity) * detail_fine + np.float32(0.55 + 0.40 * clarity) * detail_med) * edge_gate,
-            -0.09,
-            0.09,
+            (w_sub * d_subpixel + w_fine * d_fine + w_med * d_med + np.float32(0.60) * shock) * edge_gate * dark_gate,
+            -0.12,
+            0.12,
         )
         hd_f = np.clip(hr_arr + sharp_delta[:, :, None], 0.0, 1.0).astype(np.float32)
         return Image.fromarray((np.clip(hd_f, 0, 1) * 255.0).round().astype(np.uint8))
@@ -1690,6 +1704,7 @@ def run_inference_cached(
     full_res: bool = True,
     output_res: str = "4K UHD (3840px Crisp)",
     super_sample: str = "HD Super-Sample (2× IBP + De-Blur)",
+    engine_version: str = "v4k_pro_acutance_2026",
 ) -> dict:
     """Cached inference so repeated clicks don't re-run."""
     pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
