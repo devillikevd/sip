@@ -266,6 +266,35 @@ class ClassicalEnhancer:
         except ImportError:
             return img_f
 
+    def _analyze_scene(self, img_f: np.ndarray) -> dict:
+        """Estimate dynamic scene properties for intelligent, context-aware enhancement."""
+        lum = _luma_f32(img_f)
+        p02, p10, p25, p50, p75, p98 = np.percentile(lum, [2, 10, 25, 50, 75, 98])
+        dark_frac = float(np.mean(lum < 0.10))
+        bright_frac = float(np.mean(lum > 0.85))
+
+        has_isolated_lights = (bright_frac < 0.08) and (bright_frac > 0.0005) and (p02 < 0.06) and (p25 < 0.12)
+        is_backlit_night = (dark_frac > 0.30) and (p50 < 0.20) and (p98 > 0.65)
+        is_landscape_nature = (p02 > 0.08) and (p25 > 0.12) and not has_isolated_lights
+        is_extreme_dark = (p50 < 0.08) and (dark_frac > 0.60)
+        is_hdr_contrast = bool(is_backlit_night or has_isolated_lights)
+
+        return {
+            "p02": float(p02),
+            "p10": float(p10),
+            "p25": float(p25),
+            "p50": float(p50),
+            "p75": float(p75),
+            "p98": float(p98),
+            "dark_frac": dark_frac,
+            "bright_frac": bright_frac,
+            "has_isolated_lights": has_isolated_lights,
+            "is_backlit_night": is_backlit_night,
+            "is_landscape_nature": is_landscape_nature,
+            "is_extreme_dark": is_extreme_dark,
+            "is_hdr_contrast": is_hdr_contrast,
+        }
+
     def _retinex_lift(
         self,
         img_f: np.ndarray,
@@ -273,65 +302,82 @@ class ClassicalEnhancer:
         shadow_lift: float = 1.2,
         light_boost: float = 0.85,
         exposure_ev: float = 0.50,
+        scene_info: Optional[dict] = None,
         is_hdr_contrast: bool = False,
         is_backlit_night: bool = False,
     ) -> np.ndarray:
         """Highlight-safe continuous Retinex illumination & rational exposure fill-light."""
-        base_target = 0.44 + 0.14 * light_boost + 0.05 * exposure_ev
-        eff_target = float(np.clip(base_target, 0.35, 0.75))
+        if scene_info is not None:
+            is_hdr_contrast = scene_info.get("is_hdr_contrast", is_hdr_contrast)
+            is_backlit_night = scene_info.get("is_backlit_night", is_backlit_night)
+            is_landscape = scene_info.get("is_landscape_nature", False)
+        else:
+            is_landscape = False
+
+        if is_landscape:
+            eff_target = float(np.clip(0.46 + 0.08 * light_boost + 0.03 * exposure_ev, 0.40, 0.65))
+            min_gamma = 0.42
+            max_gain = 2.0 + 3.0 * shadow_lift
+            hl_knee = 0.65
+        elif is_hdr_contrast:
+            eff_target = float(np.clip(0.42 + 0.12 * light_boost + 0.04 * exposure_ev, 0.35, 0.68))
+            min_gamma = 0.28
+            max_gain = 2.5 + 5.5 * shadow_lift
+            hl_knee = 0.35
+        else:
+            eff_target = float(np.clip(0.44 + 0.14 * light_boost + 0.05 * exposure_ev, 0.35, 0.75))
+            min_gamma = 0.18
+            max_gain = 2.0 + 8.5 * shadow_lift
+            hl_knee = 0.45
+
         scene_level = float(0.65 * np.mean(illum) + 0.35 * np.percentile(illum, 65))
         if scene_level >= eff_target:
             auto_gamma = float(np.clip(0.95 - 0.12 * light_boost, 0.65, 1.0))
         else:
-            min_gamma = 0.32 if is_hdr_contrast else 0.18
             auto_gamma = float(np.clip(np.log(eff_target) / np.log(max(scene_level, 0.025)), min_gamma, 0.92))
 
         t_enh = np.power(illum, np.float32(auto_gamma))
-        max_gain = (2.5 + 5.5 * shadow_lift) if is_hdr_contrast else (2.0 + 8.5 * shadow_lift)
         raw_gain = np.clip(t_enh / np.maximum(illum, np.float32(0.015)), 1.0, max_gain).astype(np.float32)
 
         lum_in = _luma_f32(img_f)
         h0, w0 = img_f.shape[:2]
 
-        # Optical glare field modeling — tighter radius + stronger suppression prevents white halo cloud
-        try:
-            import cv2
-            # Only catch the absolute brightest core (threshold raised to 0.78)
-            core_light = _smoothstep_f32(0.78, 0.97, lum_in)
-            # Smaller sigma = tighter halo envelope (was /15 → /28 for night-street lamp)
-            flare_halo = cv2.GaussianBlur(core_light, (0, 0), sigmaX=max(10.0, min(h0, w0) / 28.0))
-            # Steeper onset: suppression kicks in sooner and stronger
-            w_glare = _smoothstep_f32(0.004, 0.22, flare_halo)
-        except ImportError:
+        # Glare field modeling strictly for backlit night scenes with isolated lamps
+        if is_hdr_contrast or is_backlit_night:
+            try:
+                import cv2
+                core_light = _smoothstep_f32(0.78, 0.97, lum_in)
+                flare_halo = cv2.GaussianBlur(core_light, (0, 0), sigmaX=max(10.0, min(h0, w0) / 28.0))
+                w_glare = _smoothstep_f32(0.004, 0.22, flare_halo)
+            except ImportError:
+                w_glare = np.zeros_like(lum_in)
+
+            max_allowed_lum = np.minimum(
+                np.float32(1.0),
+                lum_in + np.float32(0.12) * (np.float32(1.0) - lum_in) ** 2.2
+            )
+            gain_ceiling = np.maximum(np.float32(1.0), max_allowed_lum / np.maximum(lum_in, np.float32(1e-4)))
+            gain_glare_safe = np.minimum(raw_gain, gain_ceiling).astype(np.float32)
+            hl_ref = np.maximum(lum_in, illum)
+            hl_prot = _smoothstep_f32(0.88, hl_knee, hl_ref)
+            gain_scene = np.float32(1.0) + (raw_gain - np.float32(1.0)) * hl_prot
+            gain_lamp = np.float32(1.0) + (gain_glare_safe * (np.float32(1.0) - np.float32(0.85) * w_glare) - np.float32(1.0)) * hl_prot
+            gain_combined = (gain_scene * (np.float32(1.0) - w_glare) + gain_lamp * w_glare).astype(np.float32)
+        else:
             w_glare = np.zeros_like(lum_in)
+            hl_ref = np.maximum(lum_in, illum)
+            hl_prot = _smoothstep_f32(0.92, hl_knee, hl_ref)
+            gain_combined = (np.float32(1.0) + (raw_gain - np.float32(1.0)) * hl_prot).astype(np.float32)
 
-        # Glare ceiling strictly inside the glare field (prevents halo inversion and blooming clouds)
-        # Stricter ceiling: lamp can only rise by 12% over its input luminance (was 24%)
-        max_allowed_lum = np.minimum(
-            np.float32(1.0),
-            lum_in + np.float32(0.12) * (np.float32(1.0) - lum_in) ** 2.2
-        )
-        gain_ceiling = np.maximum(np.float32(1.0), max_allowed_lum / np.maximum(lum_in, np.float32(1e-4)))
-        gain_glare_safe = np.minimum(raw_gain, gain_ceiling).astype(np.float32)
-
-        # Smooth Hermite cubic highlight roll-off & optical glare compression
-        hl_ref = np.maximum(lum_in, illum)
-        hl_knee = 0.28 if is_hdr_contrast else 0.45
-        hl_prot = _smoothstep_f32(0.85, hl_knee, hl_ref)
-        gain_scene = np.float32(1.0) + (raw_gain - np.float32(1.0)) * hl_prot
-        # Stronger glare suppression in lamp zone: 0.85 instead of 0.70
-        gain_lamp = np.float32(1.0) + (gain_glare_safe * (np.float32(1.0) - np.float32(0.85) * w_glare) - np.float32(1.0)) * hl_prot
-        gain_combined = (gain_scene * (np.float32(1.0) - w_glare) + gain_lamp * w_glare).astype(np.float32)
-
-        # Smooth shadow toe protection: anchors true pitch-black night skies while giving full 4K lift to roads/foliage
+        # Smooth shadow toe protection: anchors true pitch-black night skies while lifting landscapes cleanly
         p02 = float(np.percentile(lum_in, 2))
-        floor_level = max(0.020, p02 * 0.95) if is_backlit_night else max(0.015, p02)
+        floor_level = max(0.020, p02 * 0.95) if is_backlit_night else max(0.008, p02 * 0.50)
         toe = _smoothstep_f32(floor_level * 0.80, floor_level + 0.05, lum_in)
         gain_eff = (np.float32(1.0) + (gain_combined - np.float32(1.0)) * toe).astype(np.float32)
         lifted = np.clip(img_f * gain_eff[:, :, None], 0.0, 1.0).astype(np.float32)
 
-        # Local Optical De-Veiling (restores foliage & silhouettes washed out by lamp glare)
-        if is_hdr_contrast:
+        # Local Optical De-Veiling (only for night scenes with glare)
+        if (is_hdr_contrast or is_backlit_night) and not is_landscape:
             try:
                 import cv2
                 lum_l = _luma_f32(lifted)
@@ -342,8 +388,8 @@ class ClassicalEnhancer:
             except ImportError:
                 pass
 
-        # Smooth shadow fill-light (continuous logarithmic transition without boundary steps)
-        if shadow_lift > 0:
+        # Smooth shadow fill-light
+        if shadow_lift > 0 and not is_landscape:
             k_log = np.float32(3.5 + 3.8 * shadow_lift)
             log_boost = (np.log1p(k_log * img_f) / np.log1p(k_log)).astype(np.float32)
             dm = (np.clip((np.float32(0.35) - illum) / np.float32(0.35), 0.0, 1.0)[:, :, None] ** 1.5).astype(np.float32) * toe[:, :, None]
@@ -351,7 +397,7 @@ class ClassicalEnhancer:
 
         # Rational photographic exposure
         if exposure_ev > 0.01:
-            eff_ev = exposure_ev * (0.65 if is_backlit_night else (0.75 if is_hdr_contrast else 1.0))
+            eff_ev = exposure_ev * (0.65 if is_backlit_night else (0.75 if is_hdr_contrast else 0.85))
             k_exp = np.float32(0.65 * eff_ev)
             lum = np.clip(_luma_f32(lifted), 1e-4, 1.0).astype(np.float32)
             lum_new = (np.float32(1.0) + k_exp) * lum / (np.float32(1.0) + k_exp * lum)
@@ -545,24 +591,32 @@ class ClassicalEnhancer:
             glare_mask = np.clip(flare_field * np.float32(1.40), 0.0, 1.0)
             shadow_weight = shadow_weight * (np.float32(1.0) - glare_mask)
 
-            # Minimal per-hue boosts — only on deficit pixels
-            w_foliage = _gaussian_hue_weight(h_c, 115.0, 30.0) * shadow_weight
-            w_earth   = _gaussian_hue_weight(h_c, 25.0,  20.0) * shadow_weight
-            w_azure   = _gaussian_hue_weight(h_c, 202.0, 25.0) * shadow_weight
-            w_gold    = _gaussian_hue_weight(h_c, 42.0,  15.0) * shadow_weight
-            w_indigo  = _gaussian_hue_weight(h_c, 235.0, 22.0) * shadow_weight
+            # Foliage gate: true vegetation has G > B (prevents green/cyan tint on overcast sky)
+            g_over_b = np.clip((rgb_clean[:, :, 1] - rgb_clean[:, :, 2]) * np.float32(10.0), 0.0, 1.0)
+            w_foliage = _gaussian_hue_weight(h_c, 115.0, 25.0) * shadow_weight * g_over_b
 
-            boost = (
-                sat_deficit * shadow_weight * np.float32(0.30)
-                + np.float32(0.10 * color_fill) * w_foliage
-                + np.float32(0.07 * color_fill) * w_earth
-                + np.float32(0.06 * color_fill) * w_azure
-                + np.float32(0.05 * color_fill) * w_gold
-                + np.float32(0.04 * color_fill) * w_indigo
+            # Earth/warm stone: only when R > B (warm stone/bark, never on cold sky)
+            r_over_b = np.clip((rgb_clean[:, :, 0] - rgb_clean[:, :, 2]) * np.float32(10.0), 0.0, 1.0)
+            w_earth = _gaussian_hue_weight(h_c, 25.0, 20.0) * shadow_weight * r_over_b
+
+            # Azure/sky/water: strictly gate on existing color (prevents neutral grey clouds from turning cyan)
+            has_color = _smoothstep_f32(0.12, 0.28, s_c)
+            w_azure = _gaussian_hue_weight(h_c, 202.0, 20.0) * shadow_weight * has_color
+            w_gold = _gaussian_hue_weight(h_c, 42.0, 15.0) * shadow_weight * r_over_b
+            w_indigo = _gaussian_hue_weight(h_c, 235.0, 20.0) * shadow_weight * has_color
+
+            # Vibrance applied strictly to deficit pixels — never oversaturates already-vivid colors
+            boost = sat_deficit * (
+                shadow_weight * np.float32(0.25)
+                + np.float32(0.08 * color_fill) * w_foliage
+                + np.float32(0.05 * color_fill) * w_earth
+                + np.float32(0.04 * color_fill) * w_azure
+                + np.float32(0.04 * color_fill) * w_gold
+                + np.float32(0.03 * color_fill) * w_indigo
             )
 
-            # Clip final saturation to 0.75 max in float32 [0, 1]
-            s_final = np.clip(s_c + boost, 0.0, 0.75).astype(np.float32)
+            # Clip final saturation to natural photographic 0.68 max in float32 [0, 1]
+            s_final = np.clip(s_c + boost, 0.0, 0.68).astype(np.float32)
 
             hsv[:, :, 1] = s_final
             rgb_raw = np.clip(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB), 0.0, 1.0).astype(np.float32)
@@ -600,15 +654,15 @@ class ClassicalEnhancer:
         h0, w0 = img_f.shape[:2]
         res_sc = min(max(max(h0, w0) / 480.0, 1.0), 3.0)
 
-        t0_raw = np.max(img_f, axis=2).astype(np.float32)
-        p99_raw = float(np.percentile(t0_raw, 99))
-        p25_raw = float(np.percentile(t0_raw, 25))
-        p02_raw = float(np.percentile(t0_raw, 2))
-        is_hdr_contrast = p99_raw > 0.70
-        is_backlit_night = is_hdr_contrast and (p25_raw < 0.14)
+        # Multi-factor intelligent scene characteristics analysis
+        scene_info = self._analyze_scene(img_f)
+        is_hdr_contrast = scene_info["is_hdr_contrast"]
+        is_backlit_night = scene_info["is_backlit_night"]
+        is_landscape = scene_info["is_landscape_nature"]
 
-        if is_hdr_contrast and p02_raw > 0.025:
-            ped = min(p02_raw * 0.82, 0.14)
+        # Pedestal removal strictly for fogged/veiled night scenes (NEVER on natural landscapes)
+        if is_backlit_night and scene_info["p02"] > 0.040 and scene_info["dark_frac"] > 0.45:
+            ped = min((scene_info["p02"] - 0.020) * 0.70, 0.08)
             img_f = np.clip((img_f - np.float32(ped)) / np.float32(1.0 - ped), 0.0, 1.0).astype(np.float32)
 
         illum = self._estimate_illumination(img_f)
@@ -620,6 +674,7 @@ class ClassicalEnhancer:
             shadow_lift=shadow_lift,
             light_boost=light_boost,
             exposure_ev=exposure_ev,
+            scene_info=scene_info,
             is_hdr_contrast=is_hdr_contrast,
             is_backlit_night=is_backlit_night,
         )

@@ -295,7 +295,6 @@ class SKFF(nn.Module):
         num_features = in_features[0].shape[1]
         
         in_features = torch.cat(in_features, dim = 1)
-        print(in_features.shape)
         in_features = in_features.view(batch_size, 3, num_features, in_features.shape[2], in_features.shape[3])
         
         features_u = torch.sum(in_features, dim = 1)
