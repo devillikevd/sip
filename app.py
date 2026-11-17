@@ -254,12 +254,12 @@ class ClassicalEnhancer:
 
         if is_hdr_contrast:
             sky_gate = _smoothstep_f32(0.020, 0.105, illum)
-            hl_prot = np.clip((np.float32(0.82) - illum) / np.float32(0.45), 0.0, 1.0).astype(np.float32)
+            hl_prot = _smoothstep_f32(0.92, 0.38, illum)
             gain = (
                 np.float32(1.0)
                 + (raw_gain - np.float32(1.0))
                 * (np.float32(0.20) + np.float32(0.80) * sky_gate)
-                * (np.float32(0.30) + np.float32(0.70) * hl_prot)
+                * hl_prot
             ).astype(np.float32)
         else:
             gain = raw_gain
@@ -1406,15 +1406,13 @@ def upscale_to_hd_crisp(
 
         hr_arr = np.array(cur_pil, dtype=np.float32) / np.float32(255.0)
 
-        # 4. Iterative Back-Projection (IBP) sub-pixel refinement passes
+        # 4. Ultra-Precision Float32 Iterative Back-Projection (IBP) sub-pixel refinement passes
         n_passes = max(1, min(int(n_ibp), 4))
         for _ in range(n_passes):
-            hr_p = Image.fromarray((np.clip(hr_arr, 0, 1) * 255.0).round().astype(np.uint8))
-            down_lr = np.array(hr_p.resize((w, h), Image.Resampling.LANCZOS), dtype=np.float32) / np.float32(255.0)
+            down_lr = cv2.resize(hr_arr, (w, h), interpolation=cv2.INTER_LANCZOS4)
             err_lr = cur - down_lr
-            err_p = Image.fromarray((np.clip(err_lr + np.float32(0.5), 0, 1) * 255.0).round().astype(np.uint8))
-            err_hr = (np.array(err_p.resize((tw, th), Image.Resampling.LANCZOS), dtype=np.float32) / np.float32(255.0)) - np.float32(0.5)
-            hr_arr = np.clip(hr_arr + np.float32(0.65) * err_hr, 0.0, 1.0).astype(np.float32)
+            err_hr = cv2.resize(err_lr, (tw, th), interpolation=cv2.INTER_LANCZOS4)
+            hr_arr = np.clip(hr_arr + np.float32(0.70) * err_hr, 0.0, 1.0).astype(np.float32)
 
         # 5. Single-pass camera-grade additive multi-octave 4K UHD micro-detail clarity
         hd_f = _apply_hd_clarity_tanh(hr_arr, clarity=clarity, scale_factor=1.0, noise_level=nl)
@@ -1467,6 +1465,17 @@ def file_hash(uploaded_file) -> str:
 
 
 LIGHT_PRESETS = {
+    "💎 Master Cinema HDR (Studio Reference)": {
+        "light_boost": 1.30,
+        "exposure_ev": 0.85,
+        "shadow_lift": 1.50,
+        "clarity": 0.65,
+        "clahe_clip": 1.85,
+        "saturation": 1.24,
+        "warmth": 0.0,
+        "contrast": 0.18,
+        "color_fill": 1.45,
+    },
     "👑 Ultra-Max 4K Cinema (Peak Quality)": {
         "light_boost": 1.25,
         "exposure_ev": 0.75,
@@ -1521,6 +1530,7 @@ OUTPUT_RES_MAP = {
 }
 
 SUPER_SAMPLE_MAP = {
+    "💎 Master 8× Cinema Super-Sample (Float32 IBP + Sub-Pixel Sharp)": (2, 4),
     "👑 Ultra-Max 8× Studio Super-Sample (Deep IBP + Crystal HD)": (2, 4),
     "👑 Ultra-Max 4K Pinnacle (4-Band Micro-Detail + De-Blur)": (2, 3),
     "HD Super-Sample (2× IBP + De-Blur)": (2, 2),
