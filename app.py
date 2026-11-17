@@ -215,60 +215,54 @@ class ClassicalEnhancer:
         exposure_ev: float = 0.50,
         is_backlit_night: bool = False,
     ) -> np.ndarray:
-        """Highlight-safe LIME/Retinex illumination & rational exposure curve with night-sky protection."""
-        base_target = 0.44 + 0.14 * light_boost + 0.05 * exposure_ev
+        """Spatially-adaptive, black-anchored rational illumination lift (Anti-Gray).
+        Eliminates gray/slate haze by strictly anchoring true blacks to 0, restricting
+        gain to genuinely dark shadows, and locking sky/water to 1.0x gain.
+        """
+        lum = np.clip(_luma_f32(img_f), 1e-5, 1.0).astype(np.float32)
+
+        # 1. Spatially-adaptive shadow gate:
+        # Prevents over-lifting sky, water, or well-lit areas into a milky gray slab.
+        # 1.0 in dark shadows, 0.0 in bright areas.
         if is_backlit_night:
-            base_target = min(base_target, 0.40 + 0.08 * light_boost)
-        eff_target = float(np.clip(base_target, 0.32, 0.72))
-        scene_level = float(0.65 * np.mean(illum) + 0.35 * np.percentile(illum, 65))
-        if scene_level >= eff_target:
-            auto_gamma = float(np.clip(0.95 - 0.12 * light_boost, 0.68, 1.0))
+            hl_prot = np.clip((np.float32(0.85) - illum) / np.float32(0.35), 0.0, 1.0).astype(np.float32)
+            sky_floor = _smoothstep_f32(0.015, 0.080, illum)
+            shadow_gate = ((np.float32(1.0) - _smoothstep_f32(0.05, 0.50, illum)) * hl_prot * sky_floor).astype(np.float32)
         else:
-            min_gamma = 0.35 if is_backlit_night else 0.18
-            auto_gamma = float(np.clip(np.log(eff_target) / np.log(max(scene_level, 0.025)), min_gamma, 0.92))
+            shadow_gate = (np.float32(1.0) - _smoothstep_f32(0.08, 0.45, illum)).astype(np.float32)
 
-        t_enh = np.power(illum, np.float32(auto_gamma))
-        max_gain = (2.0 + 5.8 * shadow_lift) if is_backlit_night else (2.0 + 9.0 * shadow_lift)
-        raw_gain = np.clip(t_enh / np.maximum(illum, np.float32(0.02)), 1.0, max_gain).astype(np.float32)
+        # 2. Adaptive boost parameter:
+        # Accounts for light_boost, exposure_ev, and shadow_lift
+        k_base = np.clip(
+            np.float32(0.40 * light_boost + 0.25 * exposure_ev + 0.15 * shadow_lift),
+            np.float32(0.15),
+            np.float32(0.85),
+        )
+        scene_darkness = np.clip((np.float32(0.20) - illum.mean()) / np.float32(0.15), 0.0, 1.0)
+        k_base = np.clip(k_base + np.float32(0.20) * scene_darkness, 0.15, 0.88)
 
-        if is_backlit_night:
-            sky_gate = _smoothstep_f32(0.020, 0.105, illum)
-            hl_prot = np.clip((np.float32(0.82) - illum) / np.float32(0.45), 0.0, 1.0).astype(np.float32)
-            gain = (
-                np.float32(1.0)
-                + (raw_gain - np.float32(1.0))
-                * (np.float32(0.14) + np.float32(0.86) * sky_gate)
-                * (np.float32(0.30) + np.float32(0.70) * hl_prot)
-            ).astype(np.float32)
-        else:
-            gain = raw_gain
+        # 3. Rational illumination transfer curve:
+        # Anchors at f(0) = 0 (deep natural blacks preserved, no gray floor)
+        k_pix = (k_base * shadow_gate).astype(np.float32)
+        lum_lifted = lum / (
+            lum + (np.float32(1.0) - lum) * (np.float32(1.0) - k_pix) + np.float32(1e-6)
+        )
 
-        lifted = np.clip(img_f * gain[:, :, None], 0.0, 1.0).astype(np.float32)
+        # 4. Filmic toe for rich deep shadow contrast:
+        toe = (np.float32(1.0) - np.exp(-lum / np.float32(0.018))).astype(np.float32)
+        lum_anchored = lum_lifted * toe
+        lum_target = lum * (np.float32(1.0) - shadow_gate) + lum_anchored * shadow_gate
 
-        if shadow_lift > 0:
-            k_log = 3.5 + 3.8 * shadow_lift
-            log_boost = np.log1p(k_log * img_f) / np.log1p(k_log)
-            dm = np.clip((np.float32(0.30) - illum) / np.float32(0.30), 0.0, 1.0).astype(np.float32)
-            if is_backlit_night:
-                dm = dm * (np.float32(0.14) + np.float32(0.86) * _smoothstep_f32(0.020, 0.105, illum))
-            dm = (dm[:, :, None] ** 1.6).astype(np.float32)
-            lifted = (lifted * (np.float32(1.0) - np.float32(0.22) * dm) + log_boost * (np.float32(0.22) * dm)).astype(np.float32)
+        # 5. Ratio-preserving chromaticity (locks 100% of natural hues; prevents gray-slate shifts)
+        gain = np.clip(lum_target / (lum + np.float32(1e-5)), np.float32(1.0), np.float32(4.50))[:, :, None]
+        return np.clip(img_f * gain, 0.0, 1.0).astype(np.float32)
 
-        if exposure_ev > 0.01:
-            eff_ev = exposure_ev * (0.58 if is_backlit_night else 1.0)
-            k_exp = np.float32(0.65 * eff_ev)
-            lum = np.clip(_luma_f32(lifted), 1e-4, 1.0).astype(np.float32)
-            lum_new = (np.float32(1.0) + k_exp) * lum / (np.float32(1.0) + k_exp * lum)
-            if is_backlit_night:
-                ev_mask = _smoothstep_f32(0.025, 0.12, lum) * _smoothstep_f32(0.92, 0.42, lum)
-                lum_new = lum + (lum_new - lum) * (np.float32(0.15) + np.float32(0.85) * ev_mask)
-            ratio = np.clip(lum_new / lum, 1.0, float(1.0 + k_exp))[:, :, None].astype(np.float32)
-            lifted = np.clip(lifted * ratio, 0.0, 1.0).astype(np.float32)
-
-        return np.clip(lifted, 0.0, 1.0).astype(np.float32)
-
-    def _white_balance_soft(self, img_f: np.ndarray, strength: float = 0.08) -> np.ndarray:
-        """Soft gray-world white balance so natural ambient lighting stays realistic."""
+    def _white_balance_soft(self, img_f: np.ndarray, strength: float = 0.08, is_backlit_night: bool = False) -> np.ndarray:
+        """Soft gray-world white balance for artificial night-lamp color casts.
+        Strictly bypassed on natural landscapes and vegetation to prevent gray/slate desaturation.
+        """
+        if not is_backlit_night:
+            return img_f
         m_r, m_g, m_b = img_f[:, :, 0].mean(), img_f[:, :, 1].mean(), img_f[:, :, 2].mean()
         avg = (m_r + m_g + m_b) / 3.0 + 1e-6
         wb = np.clip(
@@ -445,7 +439,7 @@ class ClassicalEnhancer:
             exposure_ev=exposure_ev,
             is_backlit_night=is_backlit_night,
         )
-        wb_f = self._white_balance_soft(lifted_f, strength=0.08)
+        wb_f = self._white_balance_soft(lifted_f, strength=0.08, is_backlit_night=is_backlit_night)
 
         lum_pre = _luma_f32(wb_f)
         noise_est = _estimate_noise_mad(lum_pre)
