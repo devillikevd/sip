@@ -144,43 +144,47 @@ def _apply_hd_clarity_tanh(
     scale_factor: float = 1.0,
     noise_level: float = 0.0,
 ) -> np.ndarray:
-    """Multi-octave, halo-free, resolution-adaptive tanh-bounded 4K UHD micro-detail clarity."""
+    """Multi-octave, halo-free, additive photographic 4K UHD micro-detail clarity.
+    Eliminates ratio division by small luminance, completely preventing dark contour lines,
+    harsh comic-book posterization, and blocky amplification.
+    """
     if clarity <= 0.01:
         return img_f
     try:
         import cv2
         h, w = img_f.shape[:2]
         y = np.clip(_luma_f32(img_f), 1e-4, 1.0).astype(np.float32)
-        base_res_sc = min(max(min(h, w) / 480.0, 1.0), 6.5)
-        r_sc = min(base_res_sc * (max(float(scale_factor), 1.0) ** 0.5), 6.5)
-        sig_sm = (0.70 + min(noise_level * 10.0, 0.60)) * r_sc
-        noise_gate = 0.012 + min(noise_level * 1.4, 0.045)
-        e_mask = _edge_confidence(y, sigma=sig_sm, gain=5.8, threshold=noise_gate)
-        lit_tex = _smoothstep_f32(0.04, 0.15, y) * (np.float32(0.10) if noise_level <= 0.015 else np.float32(0.0))
-        tex_gate = np.maximum(e_mask, lit_tex).astype(np.float32)
+        base_res_sc = min(max(min(h, w) / 480.0, 1.0), 5.0)
+        r_sc = min(base_res_sc * (max(float(scale_factor), 1.0) ** 0.5), 5.0)
+
+        # Continuous edge & texture gate (smooth transition, no binary hard edges)
+        sm = cv2.GaussianBlur(y, (0, 0), sigmaX=max(0.60 * r_sc, 0.45))
+        gx = cv2.Sobel(sm, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(sm, cv2.CV_32F, 0, 1, ksize=3)
+        grad = np.hypot(gx, gy)
+        noise_gate = np.float32(0.014 + min(noise_level * 1.5, 0.045))
+        tex_gate = np.clip(grad * np.float32(7.2) - noise_gate, 0.0, 1.0).astype(np.float32)
 
         # 4-Octave Spatial Frequency Decomposition for camera-grade 4K micro-contrast:
-        # Octave 0: Ultra-fine needle/hair/grain micro-crispness
-        dog0 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=0.50 * r_sc)).astype(np.float32)
-        # Octave 1: Fine structural edges & line sharpness
-        dog1 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=1.20 * r_sc)).astype(np.float32)
-        # Octave 2: Micro-texture (foliage, bark, stone, cloth)
+        dog0 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=0.55 * r_sc)).astype(np.float32)
+        dog1 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=1.25 * r_sc)).astype(np.float32)
         dog2 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=2.60 * r_sc)).astype(np.float32)
-        # Octave 3: Macro 3D depth pop & scene relief
-        dog3 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=6.20 * r_sc)).astype(np.float32)
+        dog3 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=5.80 * r_sc)).astype(np.float32)
 
         dog_multi = (
-            np.float32(0.30) * dog0
-            + np.float32(0.35) * dog1
-            + np.float32(0.23) * dog2
+            np.float32(0.32) * dog0
+            + np.float32(0.36) * dog1
+            + np.float32(0.20) * dog2
             + np.float32(0.12) * dog3
         ).astype(np.float32)
 
-        lim = np.float32(0.14)
-        detail = lim * np.tanh((np.float32(2.8 + 3.2 * clarity) * dog_multi) / lim) * tex_gate
-        y_hd = np.clip(y + detail, 0.0, 1.0).astype(np.float32)
-        ratio = np.clip(y_hd / (y + np.float32(1e-4)), 0.65, 1.55)[:, :, None].astype(np.float32)
-        return np.clip(img_f * ratio, 0.0, 1.0).astype(np.float32)
+        # Camera-grade additive unsharp detail: tanh bounds prevent clipping and edge halos
+        lim = np.float32(0.075)
+        gain = np.float32(1.8 + 2.2 * clarity)
+        delta = (lim * np.tanh((gain * dog_multi) / lim) * tex_gate).astype(np.float32)
+
+        # Pure additive modulation without division by y (preserves true continuous shadows)
+        return np.clip(img_f + delta[:, :, None], 0.0, 1.0).astype(np.float32)
     except ImportError:
         return img_f
 
@@ -322,7 +326,7 @@ class ClassicalEnhancer:
             yc[:, :, 2] = cv2.bilateralFilter(yc[:, :, 2], d=7, sigmaColor=0.05, sigmaSpace=2.2 * res_sc)
 
             y_u8 = np.clip(yc[:, :, 0] * 255.0, 0, 255).round().astype(np.uint8)
-            h_nlm = float(np.clip(2.4 + 145.0 * noise_est + 1.2 * max(light_boost - 0.8, 0.0), 2.2, 11.0))
+            h_nlm = float(np.clip(1.8 + 65.0 * noise_est + 0.8 * max(light_boost - 0.8, 0.0), 1.5, 5.5))
             y_nlm = (
                 cv2.fastNlMeansDenoising(y_u8, None, h=h_nlm, templateWindowSize=3, searchWindowSize=9).astype(np.float32)
                 / np.float32(255.0)
@@ -1352,11 +1356,19 @@ def upscale_to_hd_crisp(
     rl_iters: int = 2,
     n_ibp: int = 2,
 ) -> Image.Image:
-    """True 4K UHD progressive super-sampling: structural de-blocking + progressive Lanczos4 + multi-octave 4K clarity."""
+    """True 4K UHD progressive super-sampling:
+      1. Structural chroma de-blocking for compression-artifact suppression
+      2. Multi-stage progressive Lanczos4 octave interpolation
+      3. Iterative Back-Projection (IBP) sub-pixel edge refinement passes
+      4. Camera-grade additive multi-octave 4K UHD micro-detail clarity
+    """
     w, h = pil.size
     long_side = max(w, h)
     if target_long_side <= 0 or long_side >= target_long_side:
-        return pil
+        arr = np.array(pil.convert("RGB"), dtype=np.float32) / np.float32(255.0)
+        nl = _estimate_noise_mad(_luma_f32(arr)) if noise_level is None else float(noise_level)
+        out_f = _apply_hd_clarity_tanh(arr, clarity=clarity, scale_factor=1.0, noise_level=nl)
+        return Image.fromarray((out_f * np.float32(255.0)).round().astype(np.uint8))
 
     target_scale = target_long_side / float(long_side)
     tw = max(8, int(round(w * target_scale)))
@@ -1367,41 +1379,49 @@ def upscale_to_hd_crisp(
         cur = np.array(pil.convert("RGB"), dtype=np.float32) / np.float32(255.0)
         nl = _estimate_noise_mad(_luma_f32(cur)) if noise_level is None else float(noise_level)
 
-        # 1. Structural pre-upscale de-blocking (smooths 8x8 & 16x16 macroblock steps on low-contrast shadows)
-        if target_scale > 1.3:
+        # 1. Structural pre-upscale de-blocking (smooths 8x8 & 16x16 macroblock noise without edge smearing)
+        if target_scale > 1.6:
             yc = cv2.cvtColor(cur, cv2.COLOR_RGB2YCrCb)
-            y_ch = yc[:, :, 0]
-            y_flat = cv2.bilateralFilter(y_ch, d=5, sigmaColor=0.035, sigmaSpace=2.5)
-            e_conf = _edge_confidence(y_ch, sigma=0.8, gain=5.0, threshold=0.02)
-            yc[:, :, 0] = y_ch * e_conf + y_flat * (np.float32(1.0) - e_conf)
-            yc[:, :, 1] = cv2.bilateralFilter(yc[:, :, 1], d=9, sigmaColor=0.035, sigmaSpace=3.5)
-            yc[:, :, 2] = cv2.bilateralFilter(yc[:, :, 2], d=9, sigmaColor=0.035, sigmaSpace=3.5)
+            r_db = max(3, min(w, h) // 32)
+            yc[:, :, 1] = _guided_filter_f32(yc[:, :, 0], yc[:, :, 1], radius=r_db, eps=0.015)
+            yc[:, :, 2] = _guided_filter_f32(yc[:, :, 0], yc[:, :, 2], radius=r_db, eps=0.015)
             cur = np.clip(cv2.cvtColor(yc, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
 
-        # 2. Optical de-blur if requested
-        if rl_iters > 0 and clarity > 0.05:
+        # 2. Gentle optical de-blur if requested on clean inputs (additive modulation)
+        if rl_iters > 0 and clarity > 0.05 and nl < 0.025:
             y0 = np.clip(_luma_f32(cur), 1e-4, 1.0).astype(np.float32)
             y_deblur = _richardson_lucy_y(y0, sigma=0.55, n_iter=min(rl_iters, 2), noise_level=nl)
-            cur = np.clip(cur * np.clip(y_deblur / (y0 + np.float32(1e-4)), 0.85, 1.18)[:, :, None], 0.0, 1.0).astype(np.float32)
+            cur = np.clip(cur + (y_deblur - y0)[:, :, None] * np.float32(0.50), 0.0, 1.0).astype(np.float32)
 
-        # 3. Multi-stage progressive Lanczos4 super-sampling (clean, halo-free, zero-ringing)
+        # 3. Multi-stage progressive Lanczos4 super-sampling (octave-by-octave scaling)
         cw, ch = w, h
         cur_pil = Image.fromarray((np.clip(cur, 0, 1) * 255.0).round().astype(np.uint8))
         while max(cw, ch) < target_long_side:
-            if max(cw, ch) * 2.0 < target_long_side:
+            if max(cw, ch) * 2 < target_long_side:
                 cw *= 2
                 ch *= 2
             else:
                 cw, ch = tw, th
-            cur_pil = cur_pil.resize((cw, ch), Image.LANCZOS)
+            cur_pil = cur_pil.resize((cw, ch), Image.Resampling.LANCZOS)
 
-        # 4. Multi-Octave 4K UHD Micro-Detail Clarity at final UHD resolution!
-        cur_4k = np.array(cur_pil, dtype=np.float32) / np.float32(255.0)
-        hd_f = _apply_hd_clarity_tanh(cur_4k, clarity=clarity, scale_factor=1.0, noise_level=nl)
+        hr_arr = np.array(cur_pil, dtype=np.float32) / np.float32(255.0)
+
+        # 4. Iterative Back-Projection (IBP) sub-pixel refinement passes
+        n_passes = max(1, min(int(n_ibp), 4))
+        for _ in range(n_passes):
+            hr_p = Image.fromarray((np.clip(hr_arr, 0, 1) * 255.0).round().astype(np.uint8))
+            down_lr = np.array(hr_p.resize((w, h), Image.Resampling.LANCZOS), dtype=np.float32) / np.float32(255.0)
+            err_lr = cur - down_lr
+            err_p = Image.fromarray((np.clip(err_lr + np.float32(0.5), 0, 1) * 255.0).round().astype(np.uint8))
+            err_hr = (np.array(err_p.resize((tw, th), Image.Resampling.LANCZOS), dtype=np.float32) / np.float32(255.0)) - np.float32(0.5)
+            hr_arr = np.clip(hr_arr + np.float32(0.65) * err_hr, 0.0, 1.0).astype(np.float32)
+
+        # 5. Single-pass camera-grade additive multi-octave 4K UHD micro-detail clarity
+        hd_f = _apply_hd_clarity_tanh(hr_arr, clarity=clarity, scale_factor=1.0, noise_level=nl)
         return Image.fromarray((np.clip(hd_f, 0, 1) * 255.0).round().astype(np.uint8))
     except ImportError:
         from PIL import ImageFilter
-        up = pil.resize((tw, th), Image.LANCZOS)
+        up = pil.resize((tw, th), Image.Resampling.LANCZOS)
         return up.filter(ImageFilter.UnsharpMask(radius=1.5, percent=90, threshold=2))
 
 
@@ -1501,9 +1521,11 @@ OUTPUT_RES_MAP = {
 }
 
 SUPER_SAMPLE_MAP = {
-    "👑 Ultra-Max 4K Pinnacle (4-Band Micro-Detail + De-Blur)": (2, 2),
+    "👑 Ultra-Max 8× Studio Super-Sample (Deep IBP + Crystal HD)": (2, 4),
+    "👑 Ultra-Max 4K Pinnacle (4-Band Micro-Detail + De-Blur)": (2, 3),
     "HD Super-Sample (2× IBP + De-Blur)": (2, 2),
-    "Ultra 4× Super-Sample (Max HD)": (4, 3),
+    "Ultra 4× Super-Sample (Max HD)": (2, 3),
+    "Fast Standard (1× Lanczos)": (0, 1),
     "Fast Standard (1× Bicubic)": (0, 0),
 }
 
@@ -1558,8 +1580,8 @@ def run_inference_cached(
             warmth=warmth,
             contrast=contrast,
             color_fill=color_fill,
-            apply_sharpen=True,
-            rl_iters=rl_iters,
+            apply_sharpen=not will_upscale,
+            rl_iters=0 if will_upscale else rl_iters,
         )
         t_up0 = time.perf_counter()
         if will_upscale:
