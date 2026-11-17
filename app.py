@@ -140,30 +140,35 @@ def _richardson_lucy_y(
 
 def _apply_hd_clarity_tanh(
     img_f: np.ndarray,
-    clarity: float = 0.40,
+    clarity: float = 0.50,
     scale_factor: float = 1.0,
     noise_level: float = 0.0,
 ) -> np.ndarray:
-    """Apply single-pass, halo-free, tanh-bounded multi-scale DoG HD edge tightening."""
+    """Multi-octave, halo-free, resolution-adaptive tanh-bounded 4K UHD micro-detail clarity."""
     if clarity <= 0.01:
         return img_f
     try:
         import cv2
+        h, w = img_f.shape[:2]
         y = np.clip(_luma_f32(img_f), 1e-4, 1.0).astype(np.float32)
-        r_sc = min(max(float(scale_factor), 1.0), 3.0)
+        base_res_sc = min(max(min(h, w) / 480.0, 1.0), 6.5)
+        r_sc = min(base_res_sc * (max(float(scale_factor), 1.0) ** 0.5), 6.5)
         sig_sm = (0.72 + min(noise_level * 10.0, 0.65)) * r_sc
-        noise_gate = 0.022 + min(noise_level * 1.8, 0.06)
-        e_mask = _edge_confidence(y, sigma=sig_sm, gain=5.4 + 0.4 * r_sc, threshold=noise_gate)
-        lit_tex = _smoothstep_f32(0.06, 0.18, y) * (np.float32(0.06) if noise_level <= 0.012 else np.float32(0.0))
+        noise_gate = 0.015 + min(noise_level * 1.5, 0.05)
+        e_mask = _edge_confidence(y, sigma=sig_sm, gain=5.6, threshold=noise_gate)
+        lit_tex = _smoothstep_f32(0.05, 0.16, y) * (np.float32(0.08) if noise_level <= 0.015 else np.float32(0.0))
         tex_gate = np.maximum(e_mask, lit_tex).astype(np.float32)
-        dog = (
-            np.float32(0.68) * (y - cv2.GaussianBlur(y, (0, 0), sigmaX=0.68 * r_sc))
-            + np.float32(0.32) * (y - cv2.GaussianBlur(y, (0, 0), sigmaX=1.80 * r_sc))
-        ).astype(np.float32)
-        lim = np.float32(0.098)
-        detail = lim * np.tanh((np.float32(2.5 + 2.7 * clarity) * dog) / lim) * tex_gate
+
+        # Multi-Octave Difference of Gaussians (DoG) for razor-sharp 4K micro-contrast:
+        dog1 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=0.85 * r_sc)).astype(np.float32)
+        dog2 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=2.20 * r_sc)).astype(np.float32)
+        dog3 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=5.50 * r_sc)).astype(np.float32)
+        dog_multi = (np.float32(0.50) * dog1 + np.float32(0.35) * dog2 + np.float32(0.15) * dog3).astype(np.float32)
+
+        lim = np.float32(0.12)
+        detail = lim * np.tanh((np.float32(2.8 + 3.2 * clarity) * dog_multi) / lim) * tex_gate
         y_hd = np.clip(y + detail, 0.0, 1.0).astype(np.float32)
-        ratio = np.clip(y_hd / (y + np.float32(1e-4)), 0.74, 1.38)[:, :, None].astype(np.float32)
+        ratio = np.clip(y_hd / (y + np.float32(1e-4)), 0.68, 1.48)[:, :, None].astype(np.float32)
         return np.clip(img_f * ratio, 0.0, 1.0).astype(np.float32)
     except ImportError:
         return img_f
@@ -188,7 +193,7 @@ class ClassicalEnhancer:
         h, w = img_f.shape[:2]
         t0 = np.max(img_f, axis=2).astype(np.float32)
         guide = _luma_f32(img_f)
-        radius = max(12, min(32, min(h, w) // 10))
+        radius = max(16, min(56, min(h, w) // 8))
         t_refined = _guided_filter_f32(guide, t0, radius=radius, eps=0.045)
         return np.clip(np.maximum(t_refined, np.float32(0.75) * t0), 0.015, 1.0).astype(np.float32)
 
@@ -449,31 +454,26 @@ class ClassicalEnhancer:
             yc_filled[:, :, 2] = cb_filled
             rgb_filled = np.clip(cv2.cvtColor(yc_filled, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
 
-            # 4. Natural Shadow Vibrance Synthesis (eliminates dead slate-gray!)
+            # 4. Natural Shadow Vibrance Synthesis (eliminates dead slate-gray without artificial green borders)
             hsv = cv2.cvtColor(rgb_filled, cv2.COLOR_RGB2HSV)
             h_c = hsv[:, :, 0]
             s_c = hsv[:, :, 1]
             v_c = hsv[:, :, 2]
 
             # Target healthy saturation for shadows: boost muted colors towards 0.35-0.50
-            shadow_weight = (np.float32(1.0) - _smoothstep_f32(0.06, 0.45, v_c)) * float(np.clip(color_fill, 0.5, 2.0))
+            shadow_weight = (np.float32(1.0) - _smoothstep_f32(0.06, 0.48, v_c)) * float(np.clip(color_fill, 0.5, 2.0))
             sat_deficit = np.maximum(np.float32(0.40) - s_c, np.float32(0.0))
             s_boosted = s_c + np.float32(0.60) * sat_deficit * shadow_weight * (np.float32(1.0) - v_c)
 
-            # Foliage green enrichment in shadowed tree areas (H: 50-150):
-            is_foliage = (h_c >= 50.0) & (h_c <= 150.0)
-            foliage_enrich = is_foliage.astype(np.float32) * (np.float32(1.0) - _smoothstep_f32(0.08, 0.55, v_c)) * np.float32(0.14 * color_fill)
+            # Foliage green enrichment ONLY where genuine vegetation green hue exists (H: 45-155, S > 0.06):
+            is_foliage = (h_c >= 45.0) & (h_c <= 155.0) & (s_c > 0.06)
+            foliage_enrich = is_foliage.astype(np.float32) * (np.float32(1.0) - _smoothstep_f32(0.08, 0.60, v_c)) * np.float32(0.18 * color_fill)
 
-            # Warm pavement / earth tone preservation in shadows:
-            is_warm_earth = ((h_c >= 15.0) & (h_c <= 48.0)) | (h_c >= 335.0)
-            earth_enrich = is_warm_earth.astype(np.float32) * (np.float32(1.0) - _smoothstep_f32(0.08, 0.50, v_c)) * np.float32(0.08 * color_fill)
+            # Warm pavement / earth tone preservation in shadows (H: 12-42 or > 335, S > 0.05):
+            is_warm_earth = (((h_c >= 12.0) & (h_c <= 42.0)) | (h_c >= 335.0)) & (s_c > 0.05)
+            earth_enrich = is_warm_earth.astype(np.float32) * (np.float32(1.0) - _smoothstep_f32(0.08, 0.50, v_c)) * np.float32(0.10 * color_fill)
 
-            # If shadow was completely desaturated gray (s_c < 0.04), synthesize natural pine/vegetation green!
-            dead_gray = (s_c < 0.04) & (v_c < 0.35)
-            h_c[dead_gray] = 85.0
-            s_boosted[dead_gray] = np.maximum(s_boosted[dead_gray], np.float32(0.28 * color_fill))
-
-            s_final = np.clip(s_boosted + foliage_enrich + earth_enrich, 0.0, 0.68)
+            s_final = np.clip(s_boosted + foliage_enrich + earth_enrich, 0.0, 0.72)
             hsv[:, :, 0] = h_c
             hsv[:, :, 1] = s_final
             rgb_out = np.clip(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB), 0.0, 1.0).astype(np.float32)
@@ -482,10 +482,10 @@ class ClassicalEnhancer:
             if is_backlit_night:
                 y_coord = np.linspace(0.0, 1.0, h)[:, None].astype(np.float32)
                 sky_pos = np.float32(1.0) - _smoothstep_f32(0.20, 0.55, y_coord)
-                dark_flat_sky = (np.float32(1.0) - _smoothstep_f32(0.02, 0.12, illum)) * sky_pos
-                midnight_navy = np.array([0.025, 0.035, 0.055], dtype=np.float32)
-                rgb_out = (rgb_out * (np.float32(1.0) - np.float32(0.40) * dark_flat_sky[:, :, None])
-                           + midnight_navy * (np.float32(0.40) * dark_flat_sky[:, :, None])).astype(np.float32)
+                dark_flat_sky = (np.float32(1.0) - _smoothstep_f32(0.02, 0.10, illum)) * sky_pos
+                midnight_navy = np.array([0.015, 0.022, 0.038], dtype=np.float32)
+                rgb_out = (rgb_out * (np.float32(1.0) - np.float32(0.65) * dark_flat_sky[:, :, None])
+                           + midnight_navy * (np.float32(0.65) * dark_flat_sky[:, :, None])).astype(np.float32)
 
             return np.clip(rgb_out, 0.0, 1.0).astype(np.float32)
         except ImportError:
@@ -1336,81 +1336,62 @@ def resize_for_processing(pil: Image.Image, max_side: int) -> Image.Image:
 def upscale_to_hd_crisp(
     pil: Image.Image,
     target_long_side: int = 1920,
-    clarity: float = 0.40,
+    clarity: float = 0.50,
     noise_level: Optional[float] = None,
     rl_iters: int = 2,
     n_ibp: int = 2,
 ) -> Image.Image:
-    """Upscale images cleanly to HD/4K via Richardson-Lucy optical de-blur and
-    progressive 2x Iterative Back-Projection (IBP) super-sampling.
-    """
+    """True 4K UHD progressive super-sampling: structural de-blocking + progressive Lanczos4 + multi-octave 4K clarity."""
     w, h = pil.size
     long_side = max(w, h)
     if target_long_side <= 0 or long_side >= target_long_side:
         return pil
 
     target_scale = target_long_side / float(long_side)
-    target_size = (max(8, int(round(w * target_scale))), max(8, int(round(h * target_scale))))
+    tw = max(8, int(round(w * target_scale)))
+    th = max(8, int(round(h * target_scale)))
 
     try:
         import cv2
         cur = np.array(pil.convert("RGB"), dtype=np.float32) / np.float32(255.0)
         nl = _estimate_noise_mad(_luma_f32(cur)) if noise_level is None else float(noise_level)
 
-        if target_scale > 2.0:
-            # Pre-upscale structural chroma de-blocking for low-res macroblocks
-            cur_yc = cv2.cvtColor(cur, cv2.COLOR_RGB2YCrCb)
-            cur_yc[:, :, 1] = cv2.bilateralFilter(cur_yc[:, :, 1], d=7, sigmaColor=0.04, sigmaSpace=3.0)
-            cur_yc[:, :, 2] = cv2.bilateralFilter(cur_yc[:, :, 2], d=7, sigmaColor=0.04, sigmaSpace=3.0)
-            cur = np.clip(cv2.cvtColor(cur_yc, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
+        # 1. Structural pre-upscale de-blocking (smooths 8x8 & 16x16 macroblock steps on low-contrast shadows)
+        if target_scale > 1.3:
+            yc = cv2.cvtColor(cur, cv2.COLOR_RGB2YCrCb)
+            y_ch = yc[:, :, 0]
+            y_flat = cv2.bilateralFilter(y_ch, d=5, sigmaColor=0.035, sigmaSpace=2.5)
+            e_conf = _edge_confidence(y_ch, sigma=0.8, gain=5.0, threshold=0.02)
+            yc[:, :, 0] = y_ch * e_conf + y_flat * (np.float32(1.0) - e_conf)
+            yc[:, :, 1] = cv2.bilateralFilter(yc[:, :, 1], d=9, sigmaColor=0.035, sigmaSpace=3.5)
+            yc[:, :, 2] = cv2.bilateralFilter(yc[:, :, 2], d=9, sigmaColor=0.035, sigmaSpace=3.5)
+            cur = np.clip(cv2.cvtColor(yc, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
 
+        # 2. Optical de-blur if requested
         if rl_iters > 0 and clarity > 0.05:
             y0 = np.clip(_luma_f32(cur), 1e-4, 1.0).astype(np.float32)
-            y_deblur = _richardson_lucy_y(y0, sigma=0.58, n_iter=rl_iters, noise_level=nl)
-            cur = np.clip(cur * np.clip(y_deblur / (y0 + np.float32(1e-4)), 0.84, 1.20)[:, :, None], 0.0, 1.0).astype(np.float32)
+            y_deblur = _richardson_lucy_y(y0, sigma=0.55, n_iter=min(rl_iters, 2), noise_level=nl)
+            cur = np.clip(cur * np.clip(y_deblur / (y0 + np.float32(1e-4)), 0.85, 1.18)[:, :, None], 0.0, 1.0).astype(np.float32)
 
-        if n_ibp > 0:
-            cw, ch = w, h
-            tw, th = target_size
-            while max(cw, ch) < target_long_side:
-                prev = cur
-                pw, ph = cw, ch
-                if max(cw, ch) * 2.0 < target_long_side:
-                    cw *= 2
-                    ch *= 2
-                else:
-                    cw, ch = tw, th
+        # 3. Multi-stage progressive Lanczos4 super-sampling (clean, halo-free, zero-ringing)
+        cw, ch = w, h
+        cur_pil = Image.fromarray((np.clip(cur, 0, 1) * 255.0).round().astype(np.uint8))
+        while max(cw, ch) < target_long_side:
+            if max(cw, ch) * 2.0 < target_long_side:
+                cw *= 2
+                ch *= 2
+            else:
+                cw, ch = tw, th
+            cur_pil = cur_pil.resize((cw, ch), Image.LANCZOS)
 
-                up_pil = Image.fromarray((np.clip(prev, 0, 1) * 255.0).round().astype(np.uint8)).resize(
-                    (cw, ch), Image.BICUBIC
-                )
-                cur = np.array(up_pil, dtype=np.float32) / np.float32(255.0)
-
-                y_prev_ref = _luma_f32(prev)
-                y_cur = np.clip(_luma_f32(cur), 1e-4, 1.0).astype(np.float32)
-                step_iters = n_ibp if max(cw, ch) <= 2048 else 1
-                for _ in range(step_iters):
-                    y_down = cv2.resize(y_cur, (pw, ph), interpolation=cv2.INTER_AREA)
-                    err_lr = (y_prev_ref - y_down).astype(np.float32)
-                    err_hr = cv2.resize(err_lr, (cw, ch), interpolation=cv2.INTER_CUBIC)
-                    y_cur = np.clip(y_cur + np.float32(0.65) * err_hr, 0.0, 1.0).astype(np.float32)
-
-                ratio = np.clip(y_cur / (_luma_f32(cur) + np.float32(1e-4)), 0.80, 1.25)[:, :, None].astype(np.float32)
-                cur = np.clip(cur * ratio, 0.0, 1.0).astype(np.float32)
-        else:
-            up_pil = Image.fromarray((np.clip(cur, 0, 1) * 255.0).round().astype(np.uint8)).resize(
-                target_size, Image.BICUBIC
-            )
-            cur = np.array(up_pil, dtype=np.float32) / np.float32(255.0)
-
-        hd_f = _apply_hd_clarity_tanh(
-            cur, clarity=clarity, scale_factor=min(target_scale, 2.5), noise_level=nl
-        )
+        # 4. Multi-Octave 4K UHD Micro-Detail Clarity at final UHD resolution!
+        cur_4k = np.array(cur_pil, dtype=np.float32) / np.float32(255.0)
+        hd_f = _apply_hd_clarity_tanh(cur_4k, clarity=clarity, scale_factor=1.0, noise_level=nl)
         return Image.fromarray((np.clip(hd_f, 0, 1) * 255.0).round().astype(np.uint8))
     except ImportError:
         from PIL import ImageFilter
-        up = pil.resize(target_size, Image.BICUBIC)
-        return up.filter(ImageFilter.UnsharpMask(radius=1.2, percent=75, threshold=3))
+        up = pil.resize((tw, th), Image.LANCZOS)
+        return up.filter(ImageFilter.UnsharpMask(radius=1.5, percent=90, threshold=2))
 
 
 def pil_to_bytes(pil: Image.Image, fmt="PNG") -> bytes:
@@ -1456,37 +1437,37 @@ def file_hash(uploaded_file) -> str:
 
 LIGHT_PRESETS = {
     "Balanced HD (Natural)": {
-        "light_boost": 0.85,
-        "exposure_ev": 0.50,
-        "shadow_lift": 1.2,
-        "clarity": 0.40,
+        "light_boost": 1.15,
+        "exposure_ev": 0.65,
+        "shadow_lift": 1.3,
+        "clarity": 0.50,
         "clahe_clip": 1.6,
-        "saturation": 1.15,
+        "saturation": 1.18,
         "warmth": 0.0,
-        "contrast": 0.14,
-        "color_fill": 1.25,
+        "contrast": 0.16,
+        "color_fill": 1.30,
     },
     "Bright Studio Light ☀️": {
-        "light_boost": 1.35,
-        "exposure_ev": 0.95,
-        "shadow_lift": 1.6,
-        "clarity": 0.45,
+        "light_boost": 1.45,
+        "exposure_ev": 1.05,
+        "shadow_lift": 1.7,
+        "clarity": 0.55,
         "clahe_clip": 1.8,
-        "saturation": 1.18,
-        "warmth": 0.05,
-        "contrast": 0.16,
-        "color_fill": 1.35,
-    },
-    "Extreme Night Rescue 🔥": {
-        "light_boost": 1.85,
-        "exposure_ev": 1.45,
-        "shadow_lift": 2.2,
-        "clarity": 0.45,
-        "clahe_clip": 2.0,
         "saturation": 1.20,
         "warmth": 0.05,
         "contrast": 0.18,
-        "color_fill": 1.45,
+        "color_fill": 1.40,
+    },
+    "Extreme Night Rescue 🔥": {
+        "light_boost": 1.95,
+        "exposure_ev": 1.55,
+        "shadow_lift": 2.3,
+        "clarity": 0.55,
+        "clahe_clip": 2.0,
+        "saturation": 1.22,
+        "warmth": 0.05,
+        "contrast": 0.20,
+        "color_fill": 1.50,
     },
 }
 
@@ -1554,8 +1535,8 @@ def run_inference_cached(
             warmth=warmth,
             contrast=contrast,
             color_fill=color_fill,
-            apply_sharpen=not will_upscale,
-            rl_iters=0 if will_upscale else rl_iters,
+            apply_sharpen=True,
+            rl_iters=rl_iters,
         )
         t_up0 = time.perf_counter()
         if will_upscale:
