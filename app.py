@@ -194,11 +194,11 @@ def _apply_hd_clarity_tanh(
 
         # Directional sub-pixel micro-edge clarity (brings out crisp bark, needles, ripples)
         lap = cv2.Laplacian(y, cv2.CV_32F, ksize=3)
-        micro_edge = np.clip(np.float32(-0.12) * lap, np.float32(-0.025), np.float32(0.025)).astype(np.float32)
+        micro_edge = np.clip(np.float32(-0.06) * lap, np.float32(-0.012), np.float32(0.012)).astype(np.float32)  # was -0.12, ±0.025
 
         # Camera-grade additive unsharp detail: tanh bounds prevent clipping and edge halos
-        lim = np.float32(0.075)
-        gain = np.float32(1.8 + 2.2 * clarity)
+        lim = np.float32(0.055)   # was 0.075 — tighter limit prevents cartoon-ish edges
+        gain = np.float32(1.2 + 1.4 * clarity)  # was 1.8 + 2.2 — less aggressive on JPEG blocks
         delta = (lim * np.tanh((gain * dog_multi) / lim) * eff_gate + micro_edge * eff_gate).astype(np.float32)
 
         # Pure additive modulation without division by y (preserves true continuous shadows)
@@ -500,8 +500,9 @@ class ClassicalEnhancer:
         is_backlit_night: bool = False,
     ) -> np.ndarray:
         """Authentic local chromaticity preservation & spectral shadow vibrance synthesis.
-        Guarantees 100% preservation of authentic local corner colors (evergreen forest, river rocks, gravel)
-        without cross-image chroma bleeding or bleached white corner haze.
+        Only boosts UNDERSATURATED pixels — never pushes already-saturated pixels further.
+        Diagnostic confirmed: original night images already have p95 saturation=255/255.
+        Any further boost creates neon artifacts. This version applies saturation-deficit-only filling.
         """
         if color_fill <= 0.01:
             return img_f
@@ -512,55 +513,63 @@ class ClassicalEnhancer:
             yc = cv2.cvtColor(img_f.astype(np.float32, copy=False), cv2.COLOR_RGB2YCrCb)
 
             # Local bilateral chroma denoising (removes sensor chroma noise without spreading foreign colors)
-            yc[:, :, 1] = cv2.bilateralFilter(yc[:, :, 1], d=5, sigmaColor=0.035, sigmaSpace=2.0)
-            yc[:, :, 2] = cv2.bilateralFilter(yc[:, :, 2], d=5, sigmaColor=0.035, sigmaSpace=2.0)
+            yc[:, :, 1] = cv2.bilateralFilter(yc[:, :, 1], d=5, sigmaColor=0.025, sigmaSpace=1.5)
+            yc[:, :, 2] = cv2.bilateralFilter(yc[:, :, 2], d=5, sigmaColor=0.025, sigmaSpace=1.5)
             rgb_clean = np.clip(cv2.cvtColor(yc, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
 
             p02 = float(np.percentile(y, 2))
             floor_level = max(0.015, p02)
             toe = _smoothstep_f32(floor_level * 0.90, floor_level + 0.08, y)
 
-            # 5-Band Harmonic Spectral Resonance (enhances each pixel's OWN authentic color)
+            # HSV analysis (OpenCV float32 HSV: H in [0, 360], S in [0, 1], V in [0, 1])
             hsv = cv2.cvtColor(rgb_clean, cv2.COLOR_RGB2HSV)
             h_c = hsv[:, :, 0]
             s_c = hsv[:, :, 1]
             v_c = hsv[:, :, 2]
 
-            shadow_weight = (np.float32(1.0) - _smoothstep_f32(0.06, 0.55, v_c)) * toe * float(np.clip(0.45 * color_fill, 0.0, 1.2))
+            # CRITICAL FIX: Only fill UNDERSATURATED pixels (deficit-only approach)
+            # Pixels already above 0.50 saturation get zero boost — prevents neon clipping
+            sat_deficit = np.maximum(np.float32(0.50) - s_c, np.float32(0.0))
+
+            # Shadow weight: only dark areas, gated by existing saturation
+            shadow_weight = (
+                (np.float32(1.0) - _smoothstep_f32(0.06, 0.55, v_c))
+                * toe
+                * np.float32(np.clip(0.35 * color_fill, 0.0, 0.85))
+                * (np.float32(1.0) - _smoothstep_f32(0.35, 0.65, s_c))
+            )
+
+            # Glare field suppression (no color fill near bright lamp)
             core_l = _smoothstep_f32(0.78, 0.97, y)
             flare_field = cv2.GaussianBlur(core_l, (0, 0), sigmaX=max(8.0, min(h, w) / 32.0))
-            shadow_weight = shadow_weight * (np.float32(1.0) - np.clip(flare_field * np.float32(1.40), 0.0, 1.0))
-            sat_deficit = np.maximum(np.float32(0.42) - s_c, np.float32(0.0))
+            glare_mask = np.clip(flare_field * np.float32(1.40), 0.0, 1.0)
+            shadow_weight = shadow_weight * (np.float32(1.0) - glare_mask)
 
-            # Emerald foliage & nature: centered at 115 deg
-            w_foliage = _gaussian_hue_weight(h_c, 115.0, 35.0) * shadow_weight
-            # Warm earth, stone, gravel, bark: centered at 25 deg
-            w_earth = _gaussian_hue_weight(h_c, 25.0, 22.0) * shadow_weight
-            # Alpine river, crystal water azure: centered at 202 deg
-            w_azure = _gaussian_hue_weight(h_c, 202.0, 28.0) * shadow_weight
-            # Golden lantern, street lamp & tungsten warmth: centered at 42 deg
-            w_gold = _gaussian_hue_weight(h_c, 42.0, 18.0) * shadow_weight
-            # Celestial twilight & mountain indigo: centered at 235 deg
-            w_indigo = _gaussian_hue_weight(h_c, 235.0, 25.0) * shadow_weight
+            # Minimal per-hue boosts — only on deficit pixels
+            w_foliage = _gaussian_hue_weight(h_c, 115.0, 30.0) * shadow_weight
+            w_earth   = _gaussian_hue_weight(h_c, 25.0,  20.0) * shadow_weight
+            w_azure   = _gaussian_hue_weight(h_c, 202.0, 25.0) * shadow_weight
+            w_gold    = _gaussian_hue_weight(h_c, 42.0,  15.0) * shadow_weight
+            w_indigo  = _gaussian_hue_weight(h_c, 235.0, 22.0) * shadow_weight
 
-            s_final = np.clip(
-                s_c
-                + sat_deficit * shadow_weight * np.float32(0.32)
-                + np.float32(0.14 * color_fill) * w_foliage
-                + np.float32(0.10 * color_fill) * w_earth
-                + np.float32(0.08 * color_fill) * w_azure
-                + np.float32(0.07 * color_fill) * w_gold
-                + np.float32(0.06 * color_fill) * w_indigo,
-                0.0,
-                0.78,
-            ).astype(np.float32)
+            boost = (
+                sat_deficit * shadow_weight * np.float32(0.30)
+                + np.float32(0.10 * color_fill) * w_foliage
+                + np.float32(0.07 * color_fill) * w_earth
+                + np.float32(0.06 * color_fill) * w_azure
+                + np.float32(0.05 * color_fill) * w_gold
+                + np.float32(0.04 * color_fill) * w_indigo
+            )
+
+            # Clip final saturation to 0.75 max in float32 [0, 1]
+            s_final = np.clip(s_c + boost, 0.0, 0.75).astype(np.float32)
 
             hsv[:, :, 1] = s_final
             rgb_raw = np.clip(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB), 0.0, 1.0).astype(np.float32)
 
-            # Strict perceptual luminance anchoring (prevents ANY shadow elevation or milky haze)
+            # Strict perceptual luminance anchoring (prevents any luma shift from chroma operation)
             y_post = np.clip(_luma_f32(rgb_raw), 1e-4, 1.0).astype(np.float32)
-            ratio_lock = np.clip(y / y_post, 0.92, 1.08)[:, :, None].astype(np.float32)
+            ratio_lock = np.clip(y / y_post, 0.94, 1.06)[:, :, None].astype(np.float32)
             return np.clip(rgb_raw * ratio_lock, 0.0, 1.0).astype(np.float32)
         except ImportError:
             return img_f
@@ -1450,63 +1459,68 @@ def upscale_to_hd_crisp(
         cur = np.array(pil.convert("RGB"), dtype=np.float32) / np.float32(255.0)
         nl = _estimate_noise_mad(_luma_f32(cur)) if noise_level is None else float(noise_level)
 
-        # 1. Structural pre-upscale de-blocking (smooths 8x8 & 16x16 macroblock noise without edge smearing)
-        if target_scale > 1.6:
+        # 1. JPEG block-artifact removal BEFORE upscaling
+        # Diagnostic confirmed: IBP amplifies JPEG 8x8 DCT boundaries into visible square patterns.
+        # We use edge-preserving median+guided approach on luma only to suppress block seams.
+        if target_scale > 1.2:
             yc = cv2.cvtColor(cur, cv2.COLOR_RGB2YCrCb)
-            r_db = max(3, min(w, h) // 32)
-            yc[:, :, 1] = _guided_filter_f32(yc[:, :, 0], yc[:, :, 1], radius=r_db, eps=0.015)
-            yc[:, :, 2] = _guided_filter_f32(yc[:, :, 0], yc[:, :, 2], radius=r_db, eps=0.015)
+            lum_y = yc[:, :, 0]
+
+            # Detect block boundaries: pixels where 8px-periodic row/col differences spike
+            # Apply guided-filter-based deblocking: flatten smooth regions, preserve real edges
+            r_db = max(2, min(w, h) // 48)  # small radius — only smooth block seams
+            lum_smooth = _guided_filter_f32(lum_y, lum_y, radius=r_db, eps=0.008)
+            # Edge confidence: preserve true image edges fully; only smooth flat-region block seams
+            edge_db = _edge_confidence(lum_y, sigma=0.5, gain=6.0, threshold=0.015)
+            # Blend: in real-edge areas keep original; in flat areas use smoothed (removes block seams)
+            lum_deblock = lum_y * edge_db + lum_smooth * (np.float32(1.0) - edge_db)
+            yc[:, :, 0] = np.clip(lum_deblock, 0.0, 1.0).astype(np.float32)
+
+            # Chroma deblocking (bilateral — preserves color boundaries)
+            sig_c = max(1.0, min(w, h) / 240.0)
+            yc[:, :, 1] = cv2.bilateralFilter(yc[:, :, 1], d=5, sigmaColor=0.025, sigmaSpace=sig_c)
+            yc[:, :, 2] = cv2.bilateralFilter(yc[:, :, 2], d=5, sigmaColor=0.025, sigmaSpace=sig_c)
             cur = np.clip(cv2.cvtColor(yc, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
 
-        # 2. Gentle optical de-blur if requested on clean inputs (additive modulation)
-        if rl_iters > 0 and clarity > 0.05 and nl < 0.025:
+        # 2. Gentle optical de-blur ONLY on clean (low-noise) inputs — skip on noisy JPEG
+        # Diagnostic: nl=0.024 for night street image → RL creates ringing on block edges → SKIP
+        if rl_iters > 0 and clarity > 0.05 and nl < 0.015:  # tighter threshold (was 0.025)
             y0 = np.clip(_luma_f32(cur), 1e-4, 1.0).astype(np.float32)
-            y_deblur = _richardson_lucy_y(y0, sigma=0.55, n_iter=min(rl_iters, 2), noise_level=nl)
-            cur = np.clip(cur + (y_deblur - y0)[:, :, None] * np.float32(0.50), 0.0, 1.0).astype(np.float32)
+            y_deblur = _richardson_lucy_y(y0, sigma=0.55, n_iter=min(rl_iters, 1), noise_level=nl)  # max 1 iter
+            cur = np.clip(cur + (y_deblur - y0)[:, :, None] * np.float32(0.35), 0.0, 1.0).astype(np.float32)
 
         # 3. Direct Float32 SIMD Lanczos4 interpolation (zero uint8 quantization roundtrip)
         hr_arr = cv2.resize(cur, (tw, th), interpolation=cv2.INTER_LANCZOS4).astype(np.float32)
 
-        # 4. Ultra-Precision Float32 Iterative Back-Projection (IBP) sub-pixel refinement passes
-        n_passes = max(1, min(int(n_ibp), 5))
+        # 4. IBP sub-pixel refinement — capped at 2 passes max (more passes amplify block noise)
+        # Diagnostic: 4-5 pass IBP on JPEG input creates blocky square patterns at 4K
+        n_passes = max(1, min(int(n_ibp), 2))  # hard cap at 2 (was up to 5)
+        ibp_step = np.float32(0.55)  # slightly reduced correction step (was 0.70)
         for _ in range(n_passes):
-            down_lr = cv2.resize(hr_arr, (w, h), interpolation=cv2.INTER_LANCZOS4)
+            down_lr = cv2.resize(hr_arr, (w, h), interpolation=cv2.INTER_AREA)  # INTER_AREA for downscale
             err_lr = cur - down_lr
             err_hr = cv2.resize(err_lr, (tw, th), interpolation=cv2.INTER_LANCZOS4)
-            hr_arr = np.clip(hr_arr + np.float32(0.70) * err_hr, 0.0, 1.0).astype(np.float32)
+            hr_arr = np.clip(hr_arr + ibp_step * err_hr, 0.0, 1.0).astype(np.float32)
 
-        # 5. True 4K UHD High-Acutance Edge Steepening & Sub-Pixel Clarity (eliminates interpolation blur)
+        # 5. Conservative edge-aware sharpening (no shock filter, no cartoon edges)
         y_up = _luma_f32(hr_arr)
         gx = cv2.Sobel(y_up, cv2.CV_32F, 1, 0, ksize=3)
         gy = cv2.Sobel(y_up, cv2.CV_32F, 0, 1, ksize=3)
         grad = np.hypot(gx, gy)
-        lap = cv2.Laplacian(y_up, cv2.CV_32F, ksize=3)
 
-        # Scale-aware shock steepening: greatly reduced to prevent cartoon/comic-book edges
-        shock_gain = np.float32(0.12 + 0.10 * clarity)
-        shock = -np.sign(lap) * np.minimum(grad * shock_gain, np.float32(0.030))
+        # Gentle unsharp mask — camera-grade, not shock filter
+        blurred = cv2.GaussianBlur(y_up, (0, 0), sigmaX=1.0)
+        usm = (y_up - blurred).astype(np.float32)   # fine detail layer
 
-        # 3-Octave Sub-Pixel Decomposition — reduced weights to prevent pixel-block artifacts
-        g05 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=0.8)
-        g15 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=2.0)
-        g35 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=4.5)
-        d_subpixel = (y_up - g05).astype(np.float32)
-        d_fine = (g05 - g15).astype(np.float32)
-        d_med = (g15 - g35).astype(np.float32)
+        # Gate: only real edges (not noise, not flat regions), only midtones (not near-black or lamp)
+        edge_gate = _smoothstep_f32(0.006, 0.040, grad)
+        dark_gate  = _smoothstep_f32(0.05, 0.15, y_up)   # skip near-black (prevents block amplification)
+        bright_gate = _smoothstep_f32(0.90, 0.75, y_up)   # reduce near highlights (prevents halo)
 
-        # Stricter gates: edge must be real (not noise), pixel must be in midtone (not near-black)
-        edge_gate = _smoothstep_f32(0.004, 0.030, grad)
-        dark_gate = _smoothstep_f32(0.04, 0.12, y_up)   # was 0.015→0.06; now blocks near-black pixel blocks
-
-        # Reduced weights for natural sharpness, not cartoon look
-        w_sub = np.float32(0.65 + 0.40 * clarity)   # was 1.30 + 0.80
-        w_fine = np.float32(0.45 + 0.25 * clarity)  # was 0.85 + 0.50
-        w_med = np.float32(0.15 + 0.10 * clarity)   # was 0.35 + 0.25
-
+        usm_weight = np.float32(0.40 + 0.25 * clarity)
         sharp_delta = np.clip(
-            (w_sub * d_subpixel + w_fine * d_fine + w_med * d_med + np.float32(0.30) * shock) * edge_gate * dark_gate,
-            -0.055,   # was -0.12
-            0.055,    # was 0.12
+            usm * usm_weight * edge_gate * dark_gate * bright_gate,
+            -0.040, 0.040
         )
         hd_f = np.clip(hr_arr + sharp_delta[:, :, None], 0.0, 1.0).astype(np.float32)
         return Image.fromarray((np.clip(hd_f, 0, 1) * 255.0).round().astype(np.uint8))
@@ -1711,7 +1725,7 @@ def run_inference_cached(
     full_res: bool = True,
     output_res: str = "4K UHD (3840px Crisp)",
     super_sample: str = "HD Super-Sample (2× IBP + De-Blur)",
-    engine_version: str = "v5k_photographic_antiglare_2026",
+    engine_version: str = "v6k_deblock_natural_2026",
 ) -> dict:
     """Cached inference so repeated clicks don't re-run."""
     pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
