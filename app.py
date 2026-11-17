@@ -192,10 +192,14 @@ def _apply_hd_clarity_tanh(
             + np.float32(0.12) * dog3
         ).astype(np.float32)
 
+        # Directional sub-pixel micro-edge clarity (brings out crisp bark, needles, ripples)
+        lap = cv2.Laplacian(y, cv2.CV_32F, ksize=3)
+        micro_edge = np.clip(np.float32(-0.12) * lap, np.float32(-0.025), np.float32(0.025)).astype(np.float32)
+
         # Camera-grade additive unsharp detail: tanh bounds prevent clipping and edge halos
         lim = np.float32(0.075)
         gain = np.float32(1.8 + 2.2 * clarity)
-        delta = (lim * np.tanh((gain * dog_multi) / lim) * eff_gate).astype(np.float32)
+        delta = (lim * np.tanh((gain * dog_multi) / lim) * eff_gate + micro_edge * eff_gate).astype(np.float32)
 
         # Pure additive modulation without division by y (preserves true continuous shadows)
         return np.clip(img_f + delta[:, :, None], 0.0, 1.0).astype(np.float32)
@@ -225,13 +229,28 @@ class ClassicalEnhancer:
         return _guided_filter_f32(guide, src, radius=radius, eps=eps)
 
     def _estimate_illumination(self, img_f: np.ndarray) -> np.ndarray:
-        """LIME-inspired structure-aware illumination map with adaptive window radius."""
+        """Tri-scale structure-aware illumination tensor estimation (halo-free, boundary-preserving)."""
         h, w = img_f.shape[:2]
         t0 = np.max(img_f, axis=2).astype(np.float32)
         guide = _luma_f32(img_f)
-        radius = max(16, min(56, min(h, w) // 8))
-        t_refined = _guided_filter_f32(guide, t0, radius=radius, eps=0.045)
-        return np.clip(np.maximum(t_refined, np.float32(0.75) * t0), 0.015, 1.0).astype(np.float32)
+        try:
+            import cv2
+            r_fine = max(8, min(16, min(h, w) // 32))
+            r_med = max(18, min(42, min(h, w) // 12))
+            r_broad = max(36, min(80, min(h, w) // 6))
+
+            t_fine = _guided_filter_f32(guide, t0, radius=r_fine, eps=0.015)
+            t_med = _guided_filter_f32(guide, t0, radius=r_med, eps=0.035)
+            t_broad = _guided_filter_f32(guide, t0, radius=r_broad, eps=0.065)
+
+            dog_edge = np.abs(guide - cv2.GaussianBlur(guide, (0, 0), sigmaX=1.5)).astype(np.float32)
+            w_edge = _smoothstep_f32(0.015, 0.08, dog_edge)
+            t_refined = (np.float32(0.40) * t_fine * w_edge + np.float32(0.40) * t_med + np.float32(0.20) * t_broad * (np.float32(1.0) - w_edge)).astype(np.float32)
+            return np.clip(np.maximum(t_refined, np.float32(0.78) * t0), 0.015, 1.0).astype(np.float32)
+        except ImportError:
+            radius = max(16, min(56, min(h, w) // 8))
+            t_refined = _guided_filter_f32(guide, t0, radius=radius, eps=0.045)
+            return np.clip(np.maximum(t_refined, np.float32(0.75) * t0), 0.015, 1.0).astype(np.float32)
 
     def _pre_denoise_float(
         self, img_f: np.ndarray, illum: np.ndarray, res_sc: float, is_backlit_night: bool = False
@@ -458,7 +477,7 @@ class ClassicalEnhancer:
             floor_level = max(0.015, p02)
             toe = _smoothstep_f32(floor_level * 0.90, floor_level + 0.08, y)
 
-            # Continuous Spectral Shadow Vibrance (enhances each pixel's OWN authentic color)
+            # 5-Band Harmonic Spectral Resonance (enhances each pixel's OWN authentic color)
             hsv = cv2.cvtColor(rgb_clean, cv2.COLOR_RGB2HSV)
             h_c = hsv[:, :, 0]
             s_c = hsv[:, :, 1]
@@ -467,26 +486,36 @@ class ClassicalEnhancer:
             shadow_weight = (np.float32(1.0) - _smoothstep_f32(0.06, 0.55, v_c)) * toe * float(np.clip(0.60 * color_fill, 0.0, 1.6))
             sat_deficit = np.maximum(np.float32(0.42) - s_c, np.float32(0.0))
 
-            # Emerald foliage harmony: centered at 110 deg
-            w_foliage = _gaussian_hue_weight(h_c, 110.0, 35.0) * shadow_weight
-            # Warm earth, stone, gravel, bark: centered at 26 deg
-            w_earth = _gaussian_hue_weight(h_c, 26.0, 22.0) * shadow_weight
-            # Alpine river, crystal water azure: centered at 205 deg
-            w_azure = _gaussian_hue_weight(h_c, 205.0, 28.0) * shadow_weight
+            # Emerald foliage & nature: centered at 115 deg
+            w_foliage = _gaussian_hue_weight(h_c, 115.0, 35.0) * shadow_weight
+            # Warm earth, stone, gravel, bark: centered at 25 deg
+            w_earth = _gaussian_hue_weight(h_c, 25.0, 22.0) * shadow_weight
+            # Alpine river, crystal water azure: centered at 202 deg
+            w_azure = _gaussian_hue_weight(h_c, 202.0, 28.0) * shadow_weight
+            # Golden lantern, street lamp & tungsten warmth: centered at 42 deg
+            w_gold = _gaussian_hue_weight(h_c, 42.0, 18.0) * shadow_weight
+            # Celestial twilight & mountain indigo: centered at 235 deg
+            w_indigo = _gaussian_hue_weight(h_c, 235.0, 25.0) * shadow_weight
 
             s_final = np.clip(
                 s_c
-                + sat_deficit * shadow_weight * np.float32(0.45)
+                + sat_deficit * shadow_weight * np.float32(0.48)
                 + np.float32(0.24 * color_fill) * w_foliage
-                + np.float32(0.16 * color_fill) * w_earth
-                + np.float32(0.12 * color_fill) * w_azure,
+                + np.float32(0.18 * color_fill) * w_earth
+                + np.float32(0.14 * color_fill) * w_azure
+                + np.float32(0.12 * color_fill) * w_gold
+                + np.float32(0.10 * color_fill) * w_indigo,
                 0.0,
                 0.85,
             ).astype(np.float32)
 
             hsv[:, :, 1] = s_final
-            rgb_out = np.clip(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB), 0.0, 1.0).astype(np.float32)
-            return np.clip(rgb_out, 0.0, 1.0).astype(np.float32)
+            rgb_raw = np.clip(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB), 0.0, 1.0).astype(np.float32)
+
+            # Strict perceptual luminance anchoring (prevents ANY shadow elevation or milky haze)
+            y_post = np.clip(_luma_f32(rgb_raw), 1e-4, 1.0).astype(np.float32)
+            ratio_lock = np.clip(y / y_post, 0.88, 1.15)[:, :, None].astype(np.float32)
+            return np.clip(rgb_raw * ratio_lock, 0.0, 1.0).astype(np.float32)
         except ImportError:
             return img_f
 
