@@ -93,9 +93,13 @@ def _estimate_noise_mad(lum_f: np.ndarray) -> float:
 
 
 def _smoothstep_f32(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
-    """Smooth Hermite interpolation from 0 to 1 in float32."""
-    denom = max(float(edge1) - float(edge0), 1e-5)
-    t = np.clip((x.astype(np.float32, copy=False) - np.float32(edge0)) / np.float32(denom), 0.0, 1.0).astype(np.float32)
+    """Smooth Hermite interpolation from 0 (at edge0) to 1 (at edge1) in float32.
+    Properly handles both rising (edge0 < edge1) and falling (edge0 > edge1) transitions.
+    """
+    diff = float(edge1) - float(edge0)
+    if abs(diff) < 1e-6:
+        return np.where(x >= edge0, np.float32(1.0), np.float32(0.0)).astype(np.float32)
+    t = np.clip((x.astype(np.float32, copy=False) - np.float32(edge0)) / np.float32(diff), 0.0, 1.0).astype(np.float32)
     return (t * t * (np.float32(3.0) - np.float32(2.0) * t)).astype(np.float32)
 
 
@@ -191,17 +195,13 @@ class ClassicalEnhancer:
     def _pre_denoise_float(
         self, img_f: np.ndarray, illum: np.ndarray, res_sc: float, is_backlit_night: bool = False
     ) -> np.ndarray:
-        """Suppress dark chroma noise & pitch-dark RGB tint bias before Retinex gain."""
+        """Suppress dark chroma noise & compression macroblocks before Retinex gain."""
         try:
             import cv2
             yc = cv2.cvtColor(img_f.astype(np.float32, copy=False), cv2.COLOR_RGB2YCrCb)
-            sig_c = 2.2 * res_sc if is_backlit_night else 1.4 * res_sc
+            sig_c = 2.4 * res_sc if is_backlit_night else 1.4 * res_sc
             yc[:, :, 1] = cv2.GaussianBlur(yc[:, :, 1], (0, 0), sigmaX=sig_c)
             yc[:, :, 2] = cv2.GaussianBlur(yc[:, :, 2], (0, 0), sigmaX=sig_c)
-            if is_backlit_night:
-                cg = _smoothstep_f32(0.020, 0.095, illum)
-                yc[:, :, 1] = np.float32(0.5) + (yc[:, :, 1] - np.float32(0.5)) * cg
-                yc[:, :, 2] = np.float32(0.5) + (yc[:, :, 2] - np.float32(0.5)) * cg
             return np.clip(cv2.cvtColor(yc, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
         except ImportError:
             return img_f
@@ -298,15 +298,11 @@ class ClassicalEnhancer:
         try:
             import cv2
             yc = cv2.cvtColor(img_f.astype(np.float32, copy=False), cv2.COLOR_RGB2YCrCb)
-            sig_c = 2.6 * res_sc if (noise_est > 0.012 or is_backlit_night) else 1.3 * res_sc
+            sig_c = 2.6 * res_sc if (noise_est > 0.012 or is_backlit_night) else 1.4 * res_sc
             yc[:, :, 1] = cv2.GaussianBlur(yc[:, :, 1], (0, 0), sigmaX=sig_c)
             yc[:, :, 2] = cv2.GaussianBlur(yc[:, :, 2], (0, 0), sigmaX=sig_c)
-            yc[:, :, 1] = cv2.bilateralFilter(yc[:, :, 1], d=5, sigmaColor=0.06, sigmaSpace=1.6 * res_sc)
-            yc[:, :, 2] = cv2.bilateralFilter(yc[:, :, 2], d=5, sigmaColor=0.06, sigmaSpace=1.6 * res_sc)
-            if is_backlit_night:
-                cg2 = _smoothstep_f32(0.025, 0.11, illum)
-                yc[:, :, 1] = np.float32(0.5) + (yc[:, :, 1] - np.float32(0.5)) * cg2
-                yc[:, :, 2] = np.float32(0.5) + (yc[:, :, 2] - np.float32(0.5)) * cg2
+            yc[:, :, 1] = cv2.bilateralFilter(yc[:, :, 1], d=7, sigmaColor=0.05, sigmaSpace=2.2 * res_sc)
+            yc[:, :, 2] = cv2.bilateralFilter(yc[:, :, 2], d=7, sigmaColor=0.05, sigmaSpace=2.2 * res_sc)
 
             y_u8 = np.clip(yc[:, :, 0] * 255.0, 0, 255).round().astype(np.uint8)
             h_nlm = float(np.clip(2.4 + 145.0 * noise_est + 1.2 * max(light_boost - 0.8, 0.0), 2.2, 11.0))
@@ -392,12 +388,100 @@ class ClassicalEnhancer:
             mx = np.max(img_f, axis=2, keepdims=True)
             mn = np.min(img_f, axis=2, keepdims=True)
             cur_sat = (mx - mn) / np.maximum(mx, np.float32(1e-4))
-            s_gate = _smoothstep_f32(0.025, 0.12, _luma_f32(img_f))[:, :, None] if is_backlit_night else np.float32(1.0)
-            vib = (np.float32(1.0) + np.float32(saturation - 1.0) * (np.float32(1.0) - np.float32(0.45) * cur_sat) * s_gate).astype(np.float32)
+            vib = (np.float32(1.0) + np.float32(saturation - 1.0) * (np.float32(1.0) - np.float32(0.45) * cur_sat)).astype(np.float32)
             g = _luma_f32(img_f)[:, :, None]
             img_f = np.clip(g + (img_f - g) * vib, 0.0, 1.0).astype(np.float32)
 
         return np.clip(img_f, 0.0, 1.0).astype(np.float32)
+
+    def _ai_chromaticity_synthesis(
+        self,
+        img_f: np.ndarray,
+        illum: np.ndarray,
+        color_fill: float = 1.25,
+        is_backlit_night: bool = False,
+    ) -> np.ndarray:
+        """Structure-guided chromaticity diffusion and natural shadow vibrance synthesis.
+        Intelligently reconstructs rich, natural colors in dark low-light regions instead of
+        washed-out slate-gray or blotchy compression noise artifacts.
+        """
+        if color_fill <= 0.01:
+            return img_f
+        try:
+            import cv2
+            h, w = img_f.shape[:2]
+            y = np.clip(_luma_f32(img_f), 1e-4, 1.0).astype(np.float32)
+            yc = cv2.cvtColor(img_f.astype(np.float32, copy=False), cv2.COLOR_RGB2YCrCb)
+            cr = yc[:, :, 1]
+            cb = yc[:, :, 2]
+
+            # 1. Structure-guided chroma de-blocking (cleans 8x8 & 16x16 macroblock quantization noise)
+            r_guide = max(10, min(24, min(h, w) // 16))
+            cr_clean = _guided_filter_f32(y, cr, radius=r_guide, eps=0.012)
+            cb_clean = _guided_filter_f32(y, cb, radius=r_guide, eps=0.012)
+
+            # 2. Chromatic confidence: lit pixels with reliable, authentic colors
+            mx = np.max(img_f, axis=2)
+            mn = np.min(img_f, axis=2)
+            sat = (mx - mn) / (mx + np.float32(1e-4))
+            conf = _smoothstep_f32(0.04, 0.20, y) * _smoothstep_f32(0.03, 0.15, sat)
+            conf_sm = cv2.GaussianBlur(conf, (0, 0), sigmaX=max(2.5, min(h, w) / 120.0))
+
+            # 3. Propagate confident chromaticity into shadows along structural luminance edges
+            r_diff = max(18, min(48, min(h, w) // 8))
+            cr_diff_num = _guided_filter_f32(y, cr_clean * conf_sm, radius=r_diff, eps=0.025)
+            cb_diff_num = _guided_filter_f32(y, cb_clean * conf_sm, radius=r_diff, eps=0.025)
+            den = _guided_filter_f32(y, conf_sm, radius=r_diff, eps=0.025) + np.float32(1e-4)
+            cr_prop = np.clip(cr_diff_num / den, 0.0, 1.0)
+            cb_prop = np.clip(cb_diff_num / den, 0.0, 1.0)
+
+            # Blend clean local chroma with diffused chroma in shadows
+            shadow_gate = (np.float32(1.0) - conf_sm) * float(np.clip(0.42 * color_fill, 0.0, 0.88))
+            cr_filled = cr_clean * (np.float32(1.0) - shadow_gate) + cr_prop * shadow_gate
+            cb_filled = cb_clean * (np.float32(1.0) - shadow_gate) + cb_prop * shadow_gate
+
+            yc_filled = yc.copy()
+            yc_filled[:, :, 1] = cr_filled
+            yc_filled[:, :, 2] = cb_filled
+            rgb_filled = np.clip(cv2.cvtColor(yc_filled, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
+
+            # 4. Natural Shadow Vibrance Synthesis (eliminates dead slate-gray!)
+            hsv = cv2.cvtColor(rgb_filled, cv2.COLOR_RGB2HSV)
+            h_c = hsv[:, :, 0]
+            s_c = hsv[:, :, 1]
+            v_c = hsv[:, :, 2]
+
+            # Target healthy saturation for shadows: boost muted colors towards 0.35-0.50
+            shadow_weight = (np.float32(1.0) - _smoothstep_f32(0.06, 0.40, v_c)) * float(np.clip(color_fill, 0.5, 2.0))
+            sat_deficit = np.maximum(np.float32(0.40) - s_c, np.float32(0.0))
+            s_boosted = s_c + np.float32(0.60) * sat_deficit * shadow_weight * (np.float32(1.0) - v_c)
+
+            if is_backlit_night:
+                # Foliage green enrichment in shadowed tree areas:
+                is_foliage = (h_c >= 50.0) & (h_c <= 150.0)
+                foliage_enrich = is_foliage.astype(np.float32) * (np.float32(1.0) - _smoothstep_f32(0.08, 0.50, v_c)) * np.float32(0.12 * color_fill)
+                # Warm pavement / earth tone preservation in shadows:
+                is_warm_earth = ((h_c >= 15.0) & (h_c <= 48.0)) | (h_c >= 335.0)
+                earth_enrich = is_warm_earth.astype(np.float32) * (np.float32(1.0) - _smoothstep_f32(0.08, 0.48, v_c)) * np.float32(0.08 * color_fill)
+                s_final = np.clip(s_boosted + foliage_enrich + earth_enrich, 0.0, 0.68)
+            else:
+                s_final = np.clip(s_boosted, 0.0, 0.65)
+
+            hsv[:, :, 1] = s_final
+            rgb_out = np.clip(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB), 0.0, 1.0).astype(np.float32)
+
+            # 5. Night Sky Neutralization (keep high-altitude flat sky clean midnight tone, never gray/green haze)
+            if is_backlit_night:
+                y_coord = np.linspace(0.0, 1.0, h)[:, None].astype(np.float32)
+                sky_pos = np.float32(1.0) - _smoothstep_f32(0.20, 0.55, y_coord)
+                dark_flat_sky = (np.float32(1.0) - _smoothstep_f32(0.02, 0.12, illum)) * sky_pos
+                midnight_navy = np.array([0.025, 0.035, 0.055], dtype=np.float32)
+                rgb_out = (rgb_out * (np.float32(1.0) - np.float32(0.40) * dark_flat_sky[:, :, None])
+                           + midnight_navy * (np.float32(0.40) * dark_flat_sky[:, :, None])).astype(np.float32)
+
+            return np.clip(rgb_out, 0.0, 1.0).astype(np.float32)
+        except ImportError:
+            return img_f
 
     def enhance(
         self,
@@ -411,6 +495,7 @@ class ClassicalEnhancer:
         exposure_ev: float = 0.50,
         warmth: float = 0.0,
         contrast: float = 0.14,
+        color_fill: float = 1.25,
         gamma: Optional[float] = None,
         apply_sharpen: bool = True,
         rl_iters: int = 0,
@@ -463,6 +548,10 @@ class ClassicalEnhancer:
         toned_f = self._tone_and_color(
             clahe_f, saturation=saturation, warmth=warmth, contrast=contrast, is_backlit_night=is_backlit_night
         )
+        if color_fill > 0.01:
+            toned_f = self._ai_chromaticity_synthesis(
+                toned_f, illum, color_fill=color_fill, is_backlit_night=is_backlit_night
+            )
         res_noise = _estimate_noise_mad(_luma_f32(toned_f))
 
         if apply_sharpen:
@@ -1258,6 +1347,13 @@ def upscale_to_hd_crisp(
         cur = np.array(pil.convert("RGB"), dtype=np.float32) / np.float32(255.0)
         nl = _estimate_noise_mad(_luma_f32(cur)) if noise_level is None else float(noise_level)
 
+        if target_scale > 2.0:
+            # Pre-upscale structural chroma de-blocking for low-res macroblocks
+            cur_yc = cv2.cvtColor(cur, cv2.COLOR_RGB2YCrCb)
+            cur_yc[:, :, 1] = cv2.bilateralFilter(cur_yc[:, :, 1], d=7, sigmaColor=0.04, sigmaSpace=3.0)
+            cur_yc[:, :, 2] = cv2.bilateralFilter(cur_yc[:, :, 2], d=7, sigmaColor=0.04, sigmaSpace=3.0)
+            cur = np.clip(cv2.cvtColor(cur_yc, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
+
         if rl_iters > 0 and clarity > 0.05:
             y0 = np.clip(_luma_f32(cur), 1e-4, 1.0).astype(np.float32)
             y_deblur = _richardson_lucy_y(y0, sigma=0.58, n_iter=rl_iters, noise_level=nl)
@@ -1358,6 +1454,7 @@ LIGHT_PRESETS = {
         "saturation": 1.15,
         "warmth": 0.0,
         "contrast": 0.14,
+        "color_fill": 1.25,
     },
     "Bright Studio Light ☀️": {
         "light_boost": 1.35,
@@ -1368,6 +1465,7 @@ LIGHT_PRESETS = {
         "saturation": 1.18,
         "warmth": 0.05,
         "contrast": 0.16,
+        "color_fill": 1.35,
     },
     "Extreme Night Rescue 🔥": {
         "light_boost": 1.85,
@@ -1378,6 +1476,7 @@ LIGHT_PRESETS = {
         "saturation": 1.20,
         "warmth": 0.05,
         "contrast": 0.18,
+        "color_fill": 1.45,
     },
 }
 
@@ -1412,6 +1511,7 @@ def run_inference_cached(
     clarity: float = 0.40,
     warmth: float = 0.0,
     contrast: float = 0.14,
+    color_fill: float = 1.25,
     full_res: bool = True,
     output_res: str = "4K UHD (3840px Crisp)",
     super_sample: str = "HD Super-Sample (2× IBP + De-Blur)",
@@ -1443,6 +1543,7 @@ def run_inference_cached(
             clarity=clarity,
             warmth=warmth,
             contrast=contrast,
+            color_fill=color_fill,
             apply_sharpen=not will_upscale,
             rl_iters=0 if will_upscale else rl_iters,
         )
@@ -1589,6 +1690,12 @@ def render_sidebar():
                 key="tune_contrast",
                 help="Deepens clean blacks and adds rich studio contrast punch.",
             )
+            color_fill = st.slider(
+                "🎨 AI Shadow Color Fill",
+                min_value=0.0, max_value=2.0, step=0.05,
+                key="tune_color_fill",
+                help="Intelligently fills deep shadows with natural vibrant color priors instead of flat slate-gray.",
+            )
             warmth = st.slider(
                 "Color Temp (Cool ↔ Warm)",
                 min_value=-0.30, max_value=0.30, step=0.05,
@@ -1700,6 +1807,7 @@ def render_sidebar():
         "clahe_clip": clahe_clip,
         "saturation": saturation,
         "contrast": contrast,
+        "color_fill": color_fill,
         "warmth": warmth,
         "denoise": denoise,
         "full_res": full_res,
@@ -1825,6 +1933,7 @@ def tab_single(config, ckpt_path, device_str, max_side, save_to_disk, tune):
             clarity=tune["clarity"],
             warmth=tune["warmth"],
             contrast=tune["contrast"],
+            color_fill=tune.get("color_fill", 1.25),
             full_res=tune["full_res"],
             output_res=tune["output_res"],
             super_sample=tune["super_sample"],
@@ -2138,6 +2247,7 @@ def tab_batch(config, ckpt_path, device_str, max_side, save_to_disk, tune):
                 clarity=tune["clarity"],
                 warmth=tune["warmth"],
                 contrast=tune["contrast"],
+                color_fill=tune.get("color_fill", 1.25),
                 full_res=tune["full_res"],
                 output_res=tune["output_res"],
                 super_sample=tune["super_sample"],
