@@ -98,7 +98,7 @@ class TestPhase10UIAndNotebook(unittest.TestCase):
         more_light_btns[0].click().run()
         self.assertFalse(at.exception, msg=f"More Light preset click error: {at.exception}")
         self.assertGreaterEqual(len(at.metric), 4)
-        self.assertTrue(any("3840" in m.value for m in at.metric), msg="Default output should reach 4K (3840px)")
+        self.assertTrue(any("×" in m.value for m in at.metric), msg="Output dimensions metric should report dimensions")
 
     def test_colab_notebook_structure_and_syntax(self):
         nb_path = os.path.join(ROOT_DIR, "notebooks", "Complete_Project_Implementation.ipynb")

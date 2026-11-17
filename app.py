@@ -1170,30 +1170,49 @@ tr:hover td { background: rgba(255, 255, 255, 0.08); }
 # ──────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model weights…")
 def load_model(config: str, checkpoint_path: Optional[str], device_str: str):
+    """Robust, validated model checkpoint loader (Phase 4).
+    Enforces strict key & tensor-dimension matching. Rejects incompatible weights
+    to prevent corrupted inference and never silently uses random initialization
+    under a 'trained' label.
+    """
     device = torch.device(device_str)
     model = build_ablation_model(config).to(device).eval()
     loaded_ckpt = None
     if checkpoint_path and Path(checkpoint_path).is_file():
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        sd = (
-            ckpt["model_state_dict"]
-            if isinstance(ckpt, dict) and "model_state_dict" in ckpt
-            else ckpt
-        )
         try:
-            model.load_state_dict(sd)
-            loaded_ckpt = checkpoint_path
-        except RuntimeError:
-            if hasattr(model, "mirnet"):
-                try:
-                    model.mirnet.load_state_dict(sd)
-                    loaded_ckpt = checkpoint_path
-                except Exception:
-                    model.load_state_dict(sd, strict=False)
-                    loaded_ckpt = f"{checkpoint_path} (partial)"
-            else:
-                model.load_state_dict(sd, strict=False)
-                loaded_ckpt = f"{checkpoint_path} (partial)"
+            ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            sd = (
+                ckpt["model_state_dict"]
+                if isinstance(ckpt, dict) and "model_state_dict" in ckpt
+                else ckpt
+            )
+            if not isinstance(sd, dict):
+                print(f"[Checkpoint Error] Checkpoint must be a state_dict, got {type(sd).__name__}")
+                return model, sum(p.numel() for p in model.parameters()), None
+
+            # Attempt direct strict load
+            try:
+                model.load_state_dict(sd, strict=True)
+                loaded_ckpt = checkpoint_path
+            except RuntimeError as e_root:
+                # If model has a .mirnet submodule (Configs B, C, D)
+                if hasattr(model, "mirnet") and model.mirnet is not None:
+                    try:
+                        model.mirnet.load_state_dict(sd, strict=True)
+                        if config == "B":
+                            loaded_ckpt = checkpoint_path
+                        else:
+                            # Configs C/D wrap MIRNet backbone with Illumination/Fusion
+                            loaded_ckpt = f"{checkpoint_path} (MIRNet backbone only; auxiliary unweighted)"
+                    except RuntimeError as e_sub:
+                        print(f"[Checkpoint Rejected] Backbone key/dimension mismatch: {e_sub}")
+                        loaded_ckpt = None
+                else:
+                    print(f"[Checkpoint Rejected] Incompatible checkpoint for Config {config}: {e_root}")
+                    loaded_ckpt = None
+        except Exception as e:
+            print(f"[Checkpoint Error] Failed to read {checkpoint_path}: {e}")
+            loaded_ckpt = None
     total_params = sum(p.numel() for p in model.parameters())
     return model, total_params, loaded_ckpt
 
@@ -1708,21 +1727,17 @@ LIGHT_PRESETS = {
 
 
 OUTPUT_RES_MAP = {
-    "4K UHD (3840px Crisp)": 3840,
-    "Full HD (1920px)": 1920,
-    "Native Resolution (Artifact-Free)": 0,
+    "Native Resolution (Artifact-Free - Recommended)": 0,
+    "Full HD (1920px Optional Upscale)": 1920,
+    "4K UHD (3840px Optional Upscale)": 3840,
     "🚀 8K Master Cinema (7680px Peak)": 7680,
 }
 
 SUPER_SAMPLE_MAP = {
-    "🚀 Quantum 16× Multi-Scale Coherence (Tensor + Float32 IBP)": (2, 5),
-    "💎 Master 8× Cinema Super-Sample (Float32 IBP + Sub-Pixel Sharp)": (2, 4),
-    "👑 Ultra-Max 8× Studio Super-Sample (Deep IBP + Crystal HD)": (2, 4),
-    "👑 Ultra-Max 4K Pinnacle (4-Band Micro-Detail + De-Blur)": (2, 3),
+    "Standard Clean (0× IBP - Artifact-Free)": (0, 0),
+    "Gentle HD Super-Sample (1× IBP)": (0, 1),
     "HD Super-Sample (2× IBP + De-Blur)": (2, 2),
     "Ultra 4× Super-Sample (Max HD)": (2, 3),
-    "Fast Standard (1× Lanczos)": (0, 1),
-    "Fast Standard (1× Bicubic)": (0, 0),
 }
 
 
@@ -1745,14 +1760,14 @@ def run_inference_cached(
     contrast: float = 0.14,
     color_fill: float = 1.25,
     full_res: bool = True,
-    output_res: str = "4K UHD (3840px Crisp)",
-    super_sample: str = "HD Super-Sample (2× IBP + De-Blur)",
+    output_res: str = "Native Resolution (Artifact-Free - Recommended)",
+    super_sample: str = "Standard Clean (0× IBP - Artifact-Free)",
     engine_version: str = "v8_production_recovery_2026",
 ) -> dict:
     """Cached inference so repeated clicks don't re-run."""
     pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    target_px = OUTPUT_RES_MAP.get(output_res, 3840)
-    rl_iters, n_ibp = SUPER_SAMPLE_MAP.get(super_sample, (2, 2))
+    target_px = OUTPUT_RES_MAP.get(output_res, 0)
+    rl_iters, n_ibp = SUPER_SAMPLE_MAP.get(super_sample, (0, 0))
 
     # Decide effective mode:
     # 'auto' uses trained deep checkpoint if provided; otherwise uses
