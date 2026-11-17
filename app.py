@@ -255,13 +255,13 @@ class ClassicalEnhancer:
     def _pre_denoise_float(
         self, img_f: np.ndarray, illum: np.ndarray, res_sc: float, is_backlit_night: bool = False
     ) -> np.ndarray:
-        """Suppress dark chroma noise & compression macroblocks before Retinex gain."""
+        """Suppress dark chroma noise while preserving razor-sharp color boundaries."""
         try:
             import cv2
             yc = cv2.cvtColor(img_f.astype(np.float32, copy=False), cv2.COLOR_RGB2YCrCb)
-            sig_c = 2.4 * res_sc if is_backlit_night else 1.4 * res_sc
-            yc[:, :, 1] = cv2.GaussianBlur(yc[:, :, 1], (0, 0), sigmaX=sig_c)
-            yc[:, :, 2] = cv2.GaussianBlur(yc[:, :, 2], (0, 0), sigmaX=sig_c)
+            sig_sp = max(1.2, 1.4 * res_sc)
+            yc[:, :, 1] = cv2.bilateralFilter(yc[:, :, 1], d=5, sigmaColor=0.035, sigmaSpace=sig_sp)
+            yc[:, :, 2] = cv2.bilateralFilter(yc[:, :, 2], d=5, sigmaColor=0.035, sigmaSpace=sig_sp)
             return np.clip(cv2.cvtColor(yc, cv2.COLOR_YCrCb2RGB), 0.0, 1.0).astype(np.float32)
         except ImportError:
             return img_f
@@ -290,17 +290,52 @@ class ClassicalEnhancer:
         max_gain = (2.5 + 5.5 * shadow_lift) if is_hdr_contrast else (2.0 + 8.5 * shadow_lift)
         raw_gain = np.clip(t_enh / np.maximum(illum, np.float32(0.015)), 1.0, max_gain).astype(np.float32)
 
-        # Smooth Hermite cubic highlight roll-off (protects street lamps, headlights & skies)
-        hl_prot = _smoothstep_f32(0.98, 0.45, illum)
-        gain = (np.float32(1.0) + (raw_gain - np.float32(1.0)) * hl_prot).astype(np.float32)
+        lum_in = _luma_f32(img_f)
+        h0, w0 = img_f.shape[:2]
+
+        # Optical glare field modeling (smooth halo emanating from intense light sources)
+        try:
+            import cv2
+            core_light = _smoothstep_f32(0.65, 0.95, lum_in)
+            flare_field = cv2.GaussianBlur(core_light, (0, 0), sigmaX=max(12.0, min(h0, w0) / 22.0))
+            flare_field = np.clip(flare_field * np.float32(1.30), 0.0, 1.0).astype(np.float32)
+        except ImportError:
+            flare_field = np.zeros_like(lum_in)
+
+        # Monotonic ceiling prevents glare halo/donut inversion (where flare at r=40 was brighter than r=20)
+        max_allowed_lum = np.minimum(
+            np.float32(1.0),
+            lum_in + np.float32(0.24) * (np.float32(1.0) - lum_in) ** 1.6
+        )
+        gain_ceiling = np.maximum(np.float32(1.0), max_allowed_lum / np.maximum(lum_in, np.float32(1e-4)))
+        gain_safe = np.minimum(raw_gain, gain_ceiling).astype(np.float32)
+
+        # Smooth Hermite cubic highlight roll-off & optical glare compression
+        hl_ref = np.maximum(lum_in, illum)
+        hl_knee = 0.28 if is_hdr_contrast else 0.45
+        hl_prot = _smoothstep_f32(0.82, hl_knee, hl_ref)
+        glare_damp = (np.float32(1.0) - np.float32(0.68) * flare_field).astype(np.float32)
+        gain = (np.float32(1.0) + (gain_safe * glare_damp - np.float32(1.0)) * hl_prot).astype(np.float32)
 
         # Smooth shadow toe protection: prevents dark floors, borders & deep blacks from lifting into milky gray
-        lum_in = _luma_f32(img_f)
         p02 = float(np.percentile(lum_in, 2))
-        floor_level = max(0.015, p02)
+        p25 = float(np.percentile(lum_in, 25))
+        floor_level = max(0.045, p25 * 0.90) if is_backlit_night else max(0.015, p02)
         toe = _smoothstep_f32(floor_level * 0.90, floor_level + 0.08, lum_in)
         gain_eff = (np.float32(1.0) + (gain - np.float32(1.0)) * toe).astype(np.float32)
         lifted = np.clip(img_f * gain_eff[:, :, None], 0.0, 1.0).astype(np.float32)
+
+        # Local Optical De-Veiling (restores foliage & silhouettes washed out by lamp glare)
+        if is_hdr_contrast:
+            try:
+                import cv2
+                lum_l = _luma_f32(lifted)
+                base_l = cv2.GaussianBlur(lum_l, (0, 0), sigmaX=5.0)
+                high_freq = (lum_l - base_l).astype(np.float32)
+                deveil = (high_freq * flare_field * np.float32(0.75)).astype(np.float32)
+                lifted = np.clip(lifted + deveil[:, :, None], 0.0, 1.0).astype(np.float32)
+            except ImportError:
+                pass
 
         # Smooth shadow fill-light (continuous logarithmic transition without boundary steps)
         if shadow_lift > 0:
@@ -311,11 +346,11 @@ class ClassicalEnhancer:
 
         # Rational photographic exposure
         if exposure_ev > 0.01:
-            eff_ev = exposure_ev * (0.75 if is_hdr_contrast else 1.0)
+            eff_ev = exposure_ev * (0.65 if is_backlit_night else (0.75 if is_hdr_contrast else 1.0))
             k_exp = np.float32(0.65 * eff_ev)
             lum = np.clip(_luma_f32(lifted), 1e-4, 1.0).astype(np.float32)
             lum_new = (np.float32(1.0) + k_exp) * lum / (np.float32(1.0) + k_exp * lum)
-            ev_mask = _smoothstep_f32(0.98, 0.50, lum)
+            ev_mask = _smoothstep_f32(0.98, 0.50, lum) * toe
             lum_new = lum + (lum_new - lum) * ev_mask
             ratio = np.clip(lum_new / lum, 1.0, float(1.0 + k_exp))[:, :, None].astype(np.float32)
             lifted = np.clip(lifted * ratio, 0.0, 1.0).astype(np.float32)
@@ -365,7 +400,10 @@ class ClassicalEnhancer:
             y_base = cv2.bilateralFilter(y, d=5, sigmaColor=sig_col, sigmaSpace=sig_sp)
             y_detail = (y - y_base).astype(np.float32)
 
-            tau = np.float32(max(0.003, min(0.022, 1.6 * noise_est)))
+            edge_raw = _edge_confidence(y, sigma=max(0.65, 0.55 * res_sc), gain=5.2, threshold=0.02)
+            core_l = _smoothstep_f32(0.65, 0.95, y)
+            flare_field = cv2.GaussianBlur(core_l, (0, 0), sigmaX=max(12.0, min(y.shape[0], y.shape[1]) / 22.0))
+            tau = np.float32(max(0.003, min(0.016, 1.4 * noise_est))) * (np.float32(1.0) - edge_raw) * (np.float32(1.0) - np.clip(flare_field * np.float32(1.30), 0.0, 1.0))
             detail_clean = (np.sign(y_detail) * np.maximum(np.abs(y_detail) - tau, np.float32(0.0))).astype(np.float32)
             yc[:, :, 0] = np.clip(y_base + detail_clean, 0.0, 1.0).astype(np.float32)
 
@@ -484,6 +522,9 @@ class ClassicalEnhancer:
             v_c = hsv[:, :, 2]
 
             shadow_weight = (np.float32(1.0) - _smoothstep_f32(0.06, 0.55, v_c)) * toe * float(np.clip(0.60 * color_fill, 0.0, 1.6))
+            core_l = _smoothstep_f32(0.65, 0.95, y)
+            flare_field = cv2.GaussianBlur(core_l, (0, 0), sigmaX=max(12.0, min(h, w) / 22.0))
+            shadow_weight = shadow_weight * (np.float32(1.0) - np.clip(flare_field * np.float32(1.40), 0.0, 1.0))
             sat_deficit = np.maximum(np.float32(0.42) - s_c, np.float32(0.0))
 
             # Emerald foliage & nature: centered at 115 deg
@@ -1429,8 +1470,24 @@ def upscale_to_hd_crisp(
             err_hr = cv2.resize(err_lr, (tw, th), interpolation=cv2.INTER_LANCZOS4)
             hr_arr = np.clip(hr_arr + np.float32(0.70) * err_hr, 0.0, 1.0).astype(np.float32)
 
-        # 5. Single-pass camera-grade additive multi-octave 4K UHD micro-detail clarity
-        hd_f = _apply_hd_clarity_tanh(hr_arr, clarity=clarity, scale_factor=1.0, noise_level=nl)
+        # 5. High-precision 4K UHD micro-detail & sub-pixel edge sharpness (eliminates interpolation blur)
+        y_up = _luma_f32(hr_arr)
+        g1 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=max(0.8, 0.45 * (target_scale ** 0.5)))
+        g2 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=max(1.8, 1.10 * (target_scale ** 0.5)))
+        detail_fine = (y_up - g1).astype(np.float32)
+        detail_med = (g1 - g2).astype(np.float32)
+
+        gx = cv2.Sobel(g1, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(g1, cv2.CV_32F, 0, 1, ksize=3)
+        grad = np.hypot(gx, gy)
+        edge_gate = _smoothstep_f32(0.005, 0.030, grad)
+
+        sharp_delta = np.clip(
+            (np.float32(0.95 + 0.60 * clarity) * detail_fine + np.float32(0.55 + 0.40 * clarity) * detail_med) * edge_gate,
+            -0.09,
+            0.09,
+        )
+        hd_f = np.clip(hr_arr + sharp_delta[:, :, None], 0.0, 1.0).astype(np.float32)
         return Image.fromarray((np.clip(hd_f, 0, 1) * 255.0).round().astype(np.uint8))
     except ImportError:
         from PIL import ImageFilter
@@ -1662,8 +1719,8 @@ def run_inference_cached(
             warmth=warmth,
             contrast=contrast,
             color_fill=color_fill,
-            apply_sharpen=not will_upscale,
-            rl_iters=0 if will_upscale else rl_iters,
+            apply_sharpen=True,
+            rl_iters=rl_iters,
         )
         t_up0 = time.perf_counter()
         if will_upscale:
