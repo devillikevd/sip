@@ -293,19 +293,23 @@ class ClassicalEnhancer:
         lum_in = _luma_f32(img_f)
         h0, w0 = img_f.shape[:2]
 
-        # Optical glare field modeling (smooth halo emanating from intense light sources)
+        # Optical glare field modeling — tighter radius + stronger suppression prevents white halo cloud
         try:
             import cv2
-            core_light = _smoothstep_f32(0.65, 0.95, lum_in)
-            flare_halo = cv2.GaussianBlur(core_light, (0, 0), sigmaX=max(18.0, min(h0, w0) / 15.0))
-            w_glare = _smoothstep_f32(0.01, 0.40, flare_halo)
+            # Only catch the absolute brightest core (threshold raised to 0.78)
+            core_light = _smoothstep_f32(0.78, 0.97, lum_in)
+            # Smaller sigma = tighter halo envelope (was /15 → /28 for night-street lamp)
+            flare_halo = cv2.GaussianBlur(core_light, (0, 0), sigmaX=max(10.0, min(h0, w0) / 28.0))
+            # Steeper onset: suppression kicks in sooner and stronger
+            w_glare = _smoothstep_f32(0.004, 0.22, flare_halo)
         except ImportError:
             w_glare = np.zeros_like(lum_in)
 
         # Glare ceiling strictly inside the glare field (prevents halo inversion and blooming clouds)
+        # Stricter ceiling: lamp can only rise by 12% over its input luminance (was 24%)
         max_allowed_lum = np.minimum(
             np.float32(1.0),
-            lum_in + np.float32(0.24) * (np.float32(1.0) - lum_in) ** 1.6
+            lum_in + np.float32(0.12) * (np.float32(1.0) - lum_in) ** 2.2
         )
         gain_ceiling = np.maximum(np.float32(1.0), max_allowed_lum / np.maximum(lum_in, np.float32(1e-4)))
         gain_glare_safe = np.minimum(raw_gain, gain_ceiling).astype(np.float32)
@@ -315,7 +319,8 @@ class ClassicalEnhancer:
         hl_knee = 0.28 if is_hdr_contrast else 0.45
         hl_prot = _smoothstep_f32(0.85, hl_knee, hl_ref)
         gain_scene = np.float32(1.0) + (raw_gain - np.float32(1.0)) * hl_prot
-        gain_lamp = np.float32(1.0) + (gain_glare_safe * (np.float32(1.0) - np.float32(0.70) * w_glare) - np.float32(1.0)) * hl_prot
+        # Stronger glare suppression in lamp zone: 0.85 instead of 0.70
+        gain_lamp = np.float32(1.0) + (gain_glare_safe * (np.float32(1.0) - np.float32(0.85) * w_glare) - np.float32(1.0)) * hl_prot
         gain_combined = (gain_scene * (np.float32(1.0) - w_glare) + gain_lamp * w_glare).astype(np.float32)
 
         # Smooth shadow toe protection: anchors true pitch-black night skies while giving full 4K lift to roads/foliage
@@ -401,8 +406,8 @@ class ClassicalEnhancer:
             y_detail = (y - y_base).astype(np.float32)
 
             edge_raw = _edge_confidence(y, sigma=max(0.65, 0.55 * res_sc), gain=5.2, threshold=0.02)
-            core_l = _smoothstep_f32(0.65, 0.95, y)
-            flare_field = cv2.GaussianBlur(core_l, (0, 0), sigmaX=max(12.0, min(y.shape[0], y.shape[1]) / 22.0))
+            core_l = _smoothstep_f32(0.78, 0.97, y)
+            flare_field = cv2.GaussianBlur(core_l, (0, 0), sigmaX=max(8.0, min(y.shape[0], y.shape[1]) / 32.0))
             tau = np.float32(max(0.003, min(0.016, 1.4 * noise_est))) * (np.float32(1.0) - edge_raw) * (np.float32(1.0) - np.clip(flare_field * np.float32(1.30), 0.0, 1.0))
             detail_clean = (np.sign(y_detail) * np.maximum(np.abs(y_detail) - tau, np.float32(0.0))).astype(np.float32)
             yc[:, :, 0] = np.clip(y_base + detail_clean, 0.0, 1.0).astype(np.float32)
@@ -521,9 +526,9 @@ class ClassicalEnhancer:
             s_c = hsv[:, :, 1]
             v_c = hsv[:, :, 2]
 
-            shadow_weight = (np.float32(1.0) - _smoothstep_f32(0.06, 0.55, v_c)) * toe * float(np.clip(0.60 * color_fill, 0.0, 1.6))
-            core_l = _smoothstep_f32(0.65, 0.95, y)
-            flare_field = cv2.GaussianBlur(core_l, (0, 0), sigmaX=max(12.0, min(h, w) / 22.0))
+            shadow_weight = (np.float32(1.0) - _smoothstep_f32(0.06, 0.55, v_c)) * toe * float(np.clip(0.45 * color_fill, 0.0, 1.2))
+            core_l = _smoothstep_f32(0.78, 0.97, y)
+            flare_field = cv2.GaussianBlur(core_l, (0, 0), sigmaX=max(8.0, min(h, w) / 32.0))
             shadow_weight = shadow_weight * (np.float32(1.0) - np.clip(flare_field * np.float32(1.40), 0.0, 1.0))
             sat_deficit = np.maximum(np.float32(0.42) - s_c, np.float32(0.0))
 
@@ -540,14 +545,14 @@ class ClassicalEnhancer:
 
             s_final = np.clip(
                 s_c
-                + sat_deficit * shadow_weight * np.float32(0.48)
-                + np.float32(0.24 * color_fill) * w_foliage
-                + np.float32(0.18 * color_fill) * w_earth
-                + np.float32(0.14 * color_fill) * w_azure
-                + np.float32(0.12 * color_fill) * w_gold
-                + np.float32(0.10 * color_fill) * w_indigo,
+                + sat_deficit * shadow_weight * np.float32(0.32)
+                + np.float32(0.14 * color_fill) * w_foliage
+                + np.float32(0.10 * color_fill) * w_earth
+                + np.float32(0.08 * color_fill) * w_azure
+                + np.float32(0.07 * color_fill) * w_gold
+                + np.float32(0.06 * color_fill) * w_indigo,
                 0.0,
-                0.85,
+                0.78,
             ).astype(np.float32)
 
             hsv[:, :, 1] = s_final
@@ -555,7 +560,7 @@ class ClassicalEnhancer:
 
             # Strict perceptual luminance anchoring (prevents ANY shadow elevation or milky haze)
             y_post = np.clip(_luma_f32(rgb_raw), 1e-4, 1.0).astype(np.float32)
-            ratio_lock = np.clip(y / y_post, 0.88, 1.15)[:, :, None].astype(np.float32)
+            ratio_lock = np.clip(y / y_post, 0.92, 1.08)[:, :, None].astype(np.float32)
             return np.clip(rgb_raw * ratio_lock, 0.0, 1.0).astype(np.float32)
         except ImportError:
             return img_f
@@ -1477,11 +1482,11 @@ def upscale_to_hd_crisp(
         grad = np.hypot(gx, gy)
         lap = cv2.Laplacian(y_up, cv2.CV_32F, ksize=3)
 
-        # Scale-aware shock steepening: compresses stretched Lanczos ramps back into crisp 4K transitions
-        shock_gain = np.float32(0.35 + 0.30 * clarity)
-        shock = -np.sign(lap) * np.minimum(grad * shock_gain, np.float32(0.065))
+        # Scale-aware shock steepening: greatly reduced to prevent cartoon/comic-book edges
+        shock_gain = np.float32(0.12 + 0.10 * clarity)
+        shock = -np.sign(lap) * np.minimum(grad * shock_gain, np.float32(0.030))
 
-        # 3-Octave Sub-Pixel Decomposition for camera-grade 4K texture acutance
+        # 3-Octave Sub-Pixel Decomposition — reduced weights to prevent pixel-block artifacts
         g05 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=0.8)
         g15 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=2.0)
         g35 = cv2.GaussianBlur(y_up, (0, 0), sigmaX=4.5)
@@ -1489,17 +1494,19 @@ def upscale_to_hd_crisp(
         d_fine = (g05 - g15).astype(np.float32)
         d_med = (g15 - g35).astype(np.float32)
 
-        edge_gate = _smoothstep_f32(0.002, 0.020, grad)
-        dark_gate = _smoothstep_f32(0.015, 0.06, y_up)
+        # Stricter gates: edge must be real (not noise), pixel must be in midtone (not near-black)
+        edge_gate = _smoothstep_f32(0.004, 0.030, grad)
+        dark_gate = _smoothstep_f32(0.04, 0.12, y_up)   # was 0.015→0.06; now blocks near-black pixel blocks
 
-        w_sub = np.float32(1.30 + 0.80 * clarity)
-        w_fine = np.float32(0.85 + 0.50 * clarity)
-        w_med = np.float32(0.35 + 0.25 * clarity)
+        # Reduced weights for natural sharpness, not cartoon look
+        w_sub = np.float32(0.65 + 0.40 * clarity)   # was 1.30 + 0.80
+        w_fine = np.float32(0.45 + 0.25 * clarity)  # was 0.85 + 0.50
+        w_med = np.float32(0.15 + 0.10 * clarity)   # was 0.35 + 0.25
 
         sharp_delta = np.clip(
-            (w_sub * d_subpixel + w_fine * d_fine + w_med * d_med + np.float32(0.60) * shock) * edge_gate * dark_gate,
-            -0.12,
-            0.12,
+            (w_sub * d_subpixel + w_fine * d_fine + w_med * d_med + np.float32(0.30) * shock) * edge_gate * dark_gate,
+            -0.055,   # was -0.12
+            0.055,    # was 0.12
         )
         hd_f = np.clip(hr_arr + sharp_delta[:, :, None], 0.0, 1.0).astype(np.float32)
         return Image.fromarray((np.clip(hd_f, 0, 1) * 255.0).round().astype(np.uint8))
@@ -1557,10 +1564,10 @@ LIGHT_PRESETS = {
         "shadow_lift": 1.55,
         "clarity": 0.70,
         "clahe_clip": 1.90,
-        "saturation": 1.25,
+        "saturation": 1.10,
         "warmth": 0.0,
         "contrast": 0.19,
-        "color_fill": 1.48,
+        "color_fill": 0.90,
     },
     "💎 Master Cinema HDR (Studio Reference)": {
         "light_boost": 1.30,
@@ -1568,10 +1575,10 @@ LIGHT_PRESETS = {
         "shadow_lift": 1.50,
         "clarity": 0.65,
         "clahe_clip": 1.85,
-        "saturation": 1.24,
+        "saturation": 1.08,
         "warmth": 0.0,
         "contrast": 0.18,
-        "color_fill": 1.45,
+        "color_fill": 0.85,
     },
     "👑 Ultra-Max 8K Pinnacle Reference (Neural Coherence + HDR Master)": {
         "light_boost": 1.40,
@@ -1579,10 +1586,10 @@ LIGHT_PRESETS = {
         "shadow_lift": 1.60,
         "clarity": 0.75,
         "clahe_clip": 1.95,
-        "saturation": 1.28,
+        "saturation": 1.12,
         "warmth": 0.0,
         "contrast": 0.20,
-        "color_fill": 1.50,
+        "color_fill": 0.95,
     },
     "🎬 Hollywood IMAX Night Vision (Filmic Shadow + Roll-off)": {
         "light_boost": 1.25,
@@ -1590,10 +1597,10 @@ LIGHT_PRESETS = {
         "shadow_lift": 1.40,
         "clarity": 0.60,
         "clahe_clip": 1.70,
-        "saturation": 1.18,
+        "saturation": 1.06,
         "warmth": 0.03,
         "contrast": 0.22,
-        "color_fill": 1.35,
+        "color_fill": 0.80,
     },
     "🌿 National Geographic 8K Nature (True Foliage & Crystal Water)": {
         "light_boost": 1.30,
@@ -1601,10 +1608,10 @@ LIGHT_PRESETS = {
         "shadow_lift": 1.45,
         "clarity": 0.68,
         "clahe_clip": 1.80,
-        "saturation": 1.30,
+        "saturation": 1.14,
         "warmth": -0.02,
         "contrast": 0.18,
-        "color_fill": 1.55,
+        "color_fill": 1.00,
     },
     "🏙️ Cyberpunk Neo-City (Tungsten & Neon Highlight Recovery)": {
         "light_boost": 1.35,
@@ -1612,10 +1619,10 @@ LIGHT_PRESETS = {
         "shadow_lift": 1.50,
         "clarity": 0.72,
         "clahe_clip": 1.85,
-        "saturation": 1.25,
+        "saturation": 1.10,
         "warmth": -0.01,
         "contrast": 0.24,
-        "color_fill": 1.40,
+        "color_fill": 0.85,
     },
     "👑 Ultra-Max 4K Cinema (Peak Quality)": {
         "light_boost": 1.25,
@@ -1623,10 +1630,10 @@ LIGHT_PRESETS = {
         "shadow_lift": 1.45,
         "clarity": 0.60,
         "clahe_clip": 1.8,
-        "saturation": 1.22,
+        "saturation": 1.08,
         "warmth": 0.0,
         "contrast": 0.18,
-        "color_fill": 1.40,
+        "color_fill": 0.85,
     },
     "Balanced HD (Natural)": {
         "light_boost": 1.15,
@@ -1634,10 +1641,10 @@ LIGHT_PRESETS = {
         "shadow_lift": 1.3,
         "clarity": 0.50,
         "clahe_clip": 1.6,
-        "saturation": 1.18,
+        "saturation": 1.05,
         "warmth": 0.0,
         "contrast": 0.16,
-        "color_fill": 1.30,
+        "color_fill": 0.75,
     },
     "Bright Studio Light ☀️": {
         "light_boost": 1.45,
@@ -1645,10 +1652,10 @@ LIGHT_PRESETS = {
         "shadow_lift": 1.7,
         "clarity": 0.55,
         "clahe_clip": 1.8,
-        "saturation": 1.20,
+        "saturation": 1.08,
         "warmth": 0.05,
         "contrast": 0.18,
-        "color_fill": 1.40,
+        "color_fill": 0.80,
     },
     "Extreme Night Rescue 🔥": {
         "light_boost": 1.95,
@@ -1656,10 +1663,10 @@ LIGHT_PRESETS = {
         "shadow_lift": 2.3,
         "clarity": 0.55,
         "clahe_clip": 2.0,
-        "saturation": 1.22,
+        "saturation": 1.10,
         "warmth": 0.05,
         "contrast": 0.20,
-        "color_fill": 1.50,
+        "color_fill": 0.90,
     },
 }
 
@@ -1704,7 +1711,7 @@ def run_inference_cached(
     full_res: bool = True,
     output_res: str = "4K UHD (3840px Crisp)",
     super_sample: str = "HD Super-Sample (2× IBP + De-Blur)",
-    engine_version: str = "v4k_max_hdr_clarity_2026",
+    engine_version: str = "v5k_photographic_antiglare_2026",
 ) -> dict:
     """Cached inference so repeated clicks don't re-run."""
     pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
