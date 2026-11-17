@@ -153,22 +153,33 @@ def _apply_hd_clarity_tanh(
         y = np.clip(_luma_f32(img_f), 1e-4, 1.0).astype(np.float32)
         base_res_sc = min(max(min(h, w) / 480.0, 1.0), 6.5)
         r_sc = min(base_res_sc * (max(float(scale_factor), 1.0) ** 0.5), 6.5)
-        sig_sm = (0.72 + min(noise_level * 10.0, 0.65)) * r_sc
-        noise_gate = 0.015 + min(noise_level * 1.5, 0.05)
-        e_mask = _edge_confidence(y, sigma=sig_sm, gain=5.6, threshold=noise_gate)
-        lit_tex = _smoothstep_f32(0.05, 0.16, y) * (np.float32(0.08) if noise_level <= 0.015 else np.float32(0.0))
+        sig_sm = (0.70 + min(noise_level * 10.0, 0.60)) * r_sc
+        noise_gate = 0.012 + min(noise_level * 1.4, 0.045)
+        e_mask = _edge_confidence(y, sigma=sig_sm, gain=5.8, threshold=noise_gate)
+        lit_tex = _smoothstep_f32(0.04, 0.15, y) * (np.float32(0.10) if noise_level <= 0.015 else np.float32(0.0))
         tex_gate = np.maximum(e_mask, lit_tex).astype(np.float32)
 
-        # Multi-Octave Difference of Gaussians (DoG) for razor-sharp 4K micro-contrast:
-        dog1 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=0.85 * r_sc)).astype(np.float32)
-        dog2 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=2.20 * r_sc)).astype(np.float32)
-        dog3 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=5.50 * r_sc)).astype(np.float32)
-        dog_multi = (np.float32(0.50) * dog1 + np.float32(0.35) * dog2 + np.float32(0.15) * dog3).astype(np.float32)
+        # 4-Octave Spatial Frequency Decomposition for camera-grade 4K micro-contrast:
+        # Octave 0: Ultra-fine needle/hair/grain micro-crispness
+        dog0 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=0.50 * r_sc)).astype(np.float32)
+        # Octave 1: Fine structural edges & line sharpness
+        dog1 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=1.20 * r_sc)).astype(np.float32)
+        # Octave 2: Micro-texture (foliage, bark, stone, cloth)
+        dog2 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=2.60 * r_sc)).astype(np.float32)
+        # Octave 3: Macro 3D depth pop & scene relief
+        dog3 = (y - cv2.GaussianBlur(y, (0, 0), sigmaX=6.20 * r_sc)).astype(np.float32)
 
-        lim = np.float32(0.12)
+        dog_multi = (
+            np.float32(0.30) * dog0
+            + np.float32(0.35) * dog1
+            + np.float32(0.23) * dog2
+            + np.float32(0.12) * dog3
+        ).astype(np.float32)
+
+        lim = np.float32(0.14)
         detail = lim * np.tanh((np.float32(2.8 + 3.2 * clarity) * dog_multi) / lim) * tex_gate
         y_hd = np.clip(y + detail, 0.0, 1.0).astype(np.float32)
-        ratio = np.clip(y_hd / (y + np.float32(1e-4)), 0.68, 1.48)[:, :, None].astype(np.float32)
+        ratio = np.clip(y_hd / (y + np.float32(1e-4)), 0.65, 1.55)[:, :, None].astype(np.float32)
         return np.clip(img_f * ratio, 0.0, 1.0).astype(np.float32)
     except ImportError:
         return img_f
@@ -1436,6 +1447,17 @@ def file_hash(uploaded_file) -> str:
 
 
 LIGHT_PRESETS = {
+    "👑 Ultra-Max 4K Cinema (Peak Quality)": {
+        "light_boost": 1.25,
+        "exposure_ev": 0.75,
+        "shadow_lift": 1.45,
+        "clarity": 0.60,
+        "clahe_clip": 1.8,
+        "saturation": 1.22,
+        "warmth": 0.0,
+        "contrast": 0.18,
+        "color_fill": 1.40,
+    },
     "Balanced HD (Natural)": {
         "light_boost": 1.15,
         "exposure_ev": 0.65,
@@ -1479,6 +1501,7 @@ OUTPUT_RES_MAP = {
 }
 
 SUPER_SAMPLE_MAP = {
+    "👑 Ultra-Max 4K Pinnacle (4-Band Micro-Detail + De-Blur)": (2, 2),
     "HD Super-Sample (2× IBP + De-Blur)": (2, 2),
     "Ultra 4× Super-Sample (Max HD)": (4, 3),
     "Fast Standard (1× Bicubic)": (0, 0),
@@ -1618,7 +1641,8 @@ def render_sidebar():
 
         # ── Enhancement Tuning Sliders (used in Auto/Classical)
         with st.expander("🎛️ Light & Clarity Tuning", expanded=(mode_choice != "deep")):
-            for k_d, v_d in LIGHT_PRESETS["Balanced HD (Natural)"].items():
+            default_p = list(LIGHT_PRESETS.keys())[0]
+            for k_d, v_d in LIGHT_PRESETS[default_p].items():
                 st.session_state.setdefault(f"tune_{k_d}", v_d)
 
             pending_preset = st.session_state.pop("_pending_preset", None)
@@ -2074,9 +2098,9 @@ def tab_single(config, ckpt_path, device_str, max_side, save_to_disk, tune):
                 )
 
             if will_use_classical:
-                with st.expander("🎨 Compare All 3 Light Presets Side-by-Side", expanded=False):
+                with st.expander(f"🎨 Compare All {len(LIGHT_PRESETS)} Light Presets Side-by-Side", expanded=False):
                     thumb_orig = resize_for_display(orig_pil, 560)
-                    p_cols = st.columns(3)
+                    p_cols = st.columns(len(LIGHT_PRESETS))
                     for idx_p, (p_label, p_cfg) in enumerate(LIGHT_PRESETS.items()):
                         with p_cols[idx_p]:
                             p_res = _classical_enhancer.enhance(thumb_orig, **p_cfg)
