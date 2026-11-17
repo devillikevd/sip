@@ -213,6 +213,7 @@ class ClassicalEnhancer:
         shadow_lift: float = 1.2,
         light_boost: float = 0.85,
         exposure_ev: float = 0.50,
+        is_hdr_contrast: bool = False,
         is_backlit_night: bool = False,
     ) -> np.ndarray:
         """Highlight-safe LIME/Retinex illumination & rational exposure curve with night-sky protection."""
@@ -224,20 +225,20 @@ class ClassicalEnhancer:
         if scene_level >= eff_target:
             auto_gamma = float(np.clip(0.95 - 0.12 * light_boost, 0.68, 1.0))
         else:
-            min_gamma = 0.35 if is_backlit_night else 0.18
+            min_gamma = 0.35 if is_hdr_contrast else 0.18
             auto_gamma = float(np.clip(np.log(eff_target) / np.log(max(scene_level, 0.025)), min_gamma, 0.92))
 
         t_enh = np.power(illum, np.float32(auto_gamma))
-        max_gain = (2.0 + 5.8 * shadow_lift) if is_backlit_night else (2.0 + 9.0 * shadow_lift)
+        max_gain = (2.0 + 5.8 * shadow_lift) if is_hdr_contrast else (2.0 + 9.0 * shadow_lift)
         raw_gain = np.clip(t_enh / np.maximum(illum, np.float32(0.02)), 1.0, max_gain).astype(np.float32)
 
-        if is_backlit_night:
+        if is_hdr_contrast:
             sky_gate = _smoothstep_f32(0.020, 0.105, illum)
             hl_prot = np.clip((np.float32(0.82) - illum) / np.float32(0.45), 0.0, 1.0).astype(np.float32)
             gain = (
                 np.float32(1.0)
                 + (raw_gain - np.float32(1.0))
-                * (np.float32(0.14) + np.float32(0.86) * sky_gate)
+                * (np.float32(0.20) + np.float32(0.80) * sky_gate)
                 * (np.float32(0.30) + np.float32(0.70) * hl_prot)
             ).astype(np.float32)
         else:
@@ -249,17 +250,17 @@ class ClassicalEnhancer:
             k_log = 3.5 + 3.8 * shadow_lift
             log_boost = np.log1p(k_log * img_f) / np.log1p(k_log)
             dm = np.clip((np.float32(0.30) - illum) / np.float32(0.30), 0.0, 1.0).astype(np.float32)
-            if is_backlit_night:
+            if is_hdr_contrast:
                 dm = dm * (np.float32(0.14) + np.float32(0.86) * _smoothstep_f32(0.020, 0.105, illum))
             dm = (dm[:, :, None] ** 1.6).astype(np.float32)
             lifted = (lifted * (np.float32(1.0) - np.float32(0.22) * dm) + log_boost * (np.float32(0.22) * dm)).astype(np.float32)
 
         if exposure_ev > 0.01:
-            eff_ev = exposure_ev * (0.58 if is_backlit_night else 1.0)
+            eff_ev = exposure_ev * (0.60 if is_hdr_contrast else 1.0)
             k_exp = np.float32(0.65 * eff_ev)
             lum = np.clip(_luma_f32(lifted), 1e-4, 1.0).astype(np.float32)
             lum_new = (np.float32(1.0) + k_exp) * lum / (np.float32(1.0) + k_exp * lum)
-            if is_backlit_night:
+            if is_hdr_contrast:
                 ev_mask = _smoothstep_f32(0.025, 0.12, lum) * _smoothstep_f32(0.92, 0.42, lum)
                 lum_new = lum + (lum_new - lum) * (np.float32(0.15) + np.float32(0.85) * ev_mask)
             ratio = np.clip(lum_new / lum, 1.0, float(1.0 + k_exp))[:, :, None].astype(np.float32)
@@ -333,12 +334,13 @@ class ClassicalEnhancer:
         res_sc: float,
         clarity: float = 0.40,
         clip_limit: float = 1.6,
+        is_hdr_contrast: bool = False,
         is_backlit_night: bool = False,
     ) -> np.ndarray:
         """Apply structural glare de-veiling + smooth 16-bit CLAHE gated cleanly above night floor."""
         try:
             import cv2
-            if is_backlit_night:
+            if is_hdr_contrast:
                 lum_v = np.clip(_luma_f32(img_f), 1e-4, 1.0).astype(np.float32)
                 base_l = _guided_filter_f32(lum_v, lum_v, radius=max(10, int(round(14 * res_sc))), eps=0.02)
                 veil_gate = _smoothstep_f32(0.03, 0.14, lum_v) * _smoothstep_f32(0.96, 0.55, lum_v)
@@ -351,7 +353,7 @@ class ClassicalEnhancer:
             y16 = np.clip(lum_f * 65535.0, 0, 65535).round().astype(np.uint16)
             clahe = cv2.createCLAHE(clipLimit=max(1.0, min(float(clip_limit), 1.9)), tileGridSize=(4, 4))
             y16_eq = clahe.apply(y16).astype(np.float32) / np.float32(65535.0)
-            sky_gate = _smoothstep_f32(0.04, 0.14, lum_f) if is_backlit_night else np.float32(1.0)
+            sky_gate = _smoothstep_f32(0.04, 0.14, lum_f) if is_hdr_contrast else np.float32(1.0)
             cw = ((np.float32(0.16) + np.float32(0.22) * edge_c) * sky_gate).astype(np.float32)
             y_eq = (lum_f * (np.float32(1.0) - cw) + y16_eq * cw).astype(np.float32)
             ratio = np.clip(y_eq / (lum_f + np.float32(1e-4)), 0.84, 1.30)[:, :, None].astype(np.float32)
@@ -365,10 +367,11 @@ class ClassicalEnhancer:
         saturation: float = 1.15,
         warmth: float = 0.0,
         contrast: float = 0.14,
+        is_hdr_contrast: bool = False,
         is_backlit_night: bool = False,
     ) -> np.ndarray:
         """Apply shadow-protected midtone S-curve contrast, warmth shift, and smart vibrance."""
-        eff_con = contrast * (1.30 if is_backlit_night else 1.0)
+        eff_con = contrast * (1.30 if is_hdr_contrast else 1.0)
         if abs(eff_con) > 0.01:
             lum_c = np.clip(_luma_f32(img_f), 1e-4, 1.0).astype(np.float32)
             s_c = np.float32(0.5) - np.float32(0.5) * np.cos(np.float32(np.pi) * lum_c)
@@ -399,6 +402,7 @@ class ClassicalEnhancer:
         img_f: np.ndarray,
         illum: np.ndarray,
         color_fill: float = 1.25,
+        is_hdr_contrast: bool = False,
         is_backlit_night: bool = False,
     ) -> np.ndarray:
         """Structure-guided chromaticity diffusion and natural shadow vibrance synthesis.
@@ -436,7 +440,7 @@ class ClassicalEnhancer:
             cb_prop = np.clip(cb_diff_num / den, 0.0, 1.0)
 
             # Blend clean local chroma with diffused chroma in shadows
-            shadow_gate = (np.float32(1.0) - conf_sm) * float(np.clip(0.42 * color_fill, 0.0, 0.88))
+            shadow_gate = (np.float32(1.0) - conf_sm) * float(np.clip(0.55 * color_fill, 0.0, 0.90))
             cr_filled = cr_clean * (np.float32(1.0) - shadow_gate) + cr_prop * shadow_gate
             cb_filled = cb_clean * (np.float32(1.0) - shadow_gate) + cb_prop * shadow_gate
 
@@ -452,21 +456,25 @@ class ClassicalEnhancer:
             v_c = hsv[:, :, 2]
 
             # Target healthy saturation for shadows: boost muted colors towards 0.35-0.50
-            shadow_weight = (np.float32(1.0) - _smoothstep_f32(0.06, 0.40, v_c)) * float(np.clip(color_fill, 0.5, 2.0))
+            shadow_weight = (np.float32(1.0) - _smoothstep_f32(0.06, 0.45, v_c)) * float(np.clip(color_fill, 0.5, 2.0))
             sat_deficit = np.maximum(np.float32(0.40) - s_c, np.float32(0.0))
             s_boosted = s_c + np.float32(0.60) * sat_deficit * shadow_weight * (np.float32(1.0) - v_c)
 
-            if is_backlit_night:
-                # Foliage green enrichment in shadowed tree areas:
-                is_foliage = (h_c >= 50.0) & (h_c <= 150.0)
-                foliage_enrich = is_foliage.astype(np.float32) * (np.float32(1.0) - _smoothstep_f32(0.08, 0.50, v_c)) * np.float32(0.12 * color_fill)
-                # Warm pavement / earth tone preservation in shadows:
-                is_warm_earth = ((h_c >= 15.0) & (h_c <= 48.0)) | (h_c >= 335.0)
-                earth_enrich = is_warm_earth.astype(np.float32) * (np.float32(1.0) - _smoothstep_f32(0.08, 0.48, v_c)) * np.float32(0.08 * color_fill)
-                s_final = np.clip(s_boosted + foliage_enrich + earth_enrich, 0.0, 0.68)
-            else:
-                s_final = np.clip(s_boosted, 0.0, 0.65)
+            # Foliage green enrichment in shadowed tree areas (H: 50-150):
+            is_foliage = (h_c >= 50.0) & (h_c <= 150.0)
+            foliage_enrich = is_foliage.astype(np.float32) * (np.float32(1.0) - _smoothstep_f32(0.08, 0.55, v_c)) * np.float32(0.14 * color_fill)
 
+            # Warm pavement / earth tone preservation in shadows:
+            is_warm_earth = ((h_c >= 15.0) & (h_c <= 48.0)) | (h_c >= 335.0)
+            earth_enrich = is_warm_earth.astype(np.float32) * (np.float32(1.0) - _smoothstep_f32(0.08, 0.50, v_c)) * np.float32(0.08 * color_fill)
+
+            # If shadow was completely desaturated gray (s_c < 0.04), synthesize natural pine/vegetation green!
+            dead_gray = (s_c < 0.04) & (v_c < 0.35)
+            h_c[dead_gray] = 85.0
+            s_boosted[dead_gray] = np.maximum(s_boosted[dead_gray], np.float32(0.28 * color_fill))
+
+            s_final = np.clip(s_boosted + foliage_enrich + earth_enrich, 0.0, 0.68)
+            hsv[:, :, 0] = h_c
             hsv[:, :, 1] = s_final
             rgb_out = np.clip(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB), 0.0, 1.0).astype(np.float32)
 
@@ -513,10 +521,11 @@ class ClassicalEnhancer:
         p99_raw = float(np.percentile(t0_raw, 99))
         p25_raw = float(np.percentile(t0_raw, 25))
         p02_raw = float(np.percentile(t0_raw, 2))
-        is_backlit_night = p99_raw > 0.75 and p25_raw < 0.14
+        is_hdr_contrast = p99_raw > 0.70
+        is_backlit_night = is_hdr_contrast and (p25_raw < 0.14)
 
-        if is_backlit_night and p02_raw > 0.025:
-            ped = min(p02_raw * 0.72, 0.045)
+        if is_hdr_contrast and p02_raw > 0.025:
+            ped = min(p02_raw * 0.82, 0.14)
             img_f = np.clip((img_f - np.float32(ped)) / np.float32(1.0 - ped), 0.0, 1.0).astype(np.float32)
 
         illum = self._estimate_illumination(img_f)
@@ -528,6 +537,7 @@ class ClassicalEnhancer:
             shadow_lift=shadow_lift,
             light_boost=light_boost,
             exposure_ev=exposure_ev,
+            is_hdr_contrast=is_hdr_contrast,
             is_backlit_night=is_backlit_night,
         )
         wb_f = self._white_balance_soft(lifted_f, strength=0.08)
@@ -543,14 +553,14 @@ class ClassicalEnhancer:
             edge_c = _edge_confidence(lum_pre)
 
         clahe_f = self._clahe_l_float(
-            dn_f, edge_c, res_sc=res_sc, clarity=clarity, clip_limit=clahe_clip, is_backlit_night=is_backlit_night
+            dn_f, edge_c, res_sc=res_sc, clarity=clarity, clip_limit=clahe_clip, is_hdr_contrast=is_hdr_contrast, is_backlit_night=is_backlit_night
         )
         toned_f = self._tone_and_color(
-            clahe_f, saturation=saturation, warmth=warmth, contrast=contrast, is_backlit_night=is_backlit_night
+            clahe_f, saturation=saturation, warmth=warmth, contrast=contrast, is_hdr_contrast=is_hdr_contrast, is_backlit_night=is_backlit_night
         )
         if color_fill > 0.01:
             toned_f = self._ai_chromaticity_synthesis(
-                toned_f, illum, color_fill=color_fill, is_backlit_night=is_backlit_night
+                toned_f, illum, color_fill=color_fill, is_hdr_contrast=is_hdr_contrast, is_backlit_night=is_backlit_night
             )
         res_noise = _estimate_noise_mad(_luma_f32(toned_f))
 
