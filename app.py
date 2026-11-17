@@ -297,32 +297,32 @@ class ClassicalEnhancer:
         try:
             import cv2
             core_light = _smoothstep_f32(0.65, 0.95, lum_in)
-            flare_field = cv2.GaussianBlur(core_light, (0, 0), sigmaX=max(12.0, min(h0, w0) / 22.0))
-            flare_field = np.clip(flare_field * np.float32(1.30), 0.0, 1.0).astype(np.float32)
+            flare_halo = cv2.GaussianBlur(core_light, (0, 0), sigmaX=max(18.0, min(h0, w0) / 15.0))
+            w_glare = _smoothstep_f32(0.01, 0.40, flare_halo)
         except ImportError:
-            flare_field = np.zeros_like(lum_in)
+            w_glare = np.zeros_like(lum_in)
 
-        # Monotonic ceiling prevents glare halo/donut inversion (where flare at r=40 was brighter than r=20)
+        # Glare ceiling strictly inside the glare field (prevents halo inversion and blooming clouds)
         max_allowed_lum = np.minimum(
             np.float32(1.0),
             lum_in + np.float32(0.24) * (np.float32(1.0) - lum_in) ** 1.6
         )
         gain_ceiling = np.maximum(np.float32(1.0), max_allowed_lum / np.maximum(lum_in, np.float32(1e-4)))
-        gain_safe = np.minimum(raw_gain, gain_ceiling).astype(np.float32)
+        gain_glare_safe = np.minimum(raw_gain, gain_ceiling).astype(np.float32)
 
         # Smooth Hermite cubic highlight roll-off & optical glare compression
         hl_ref = np.maximum(lum_in, illum)
         hl_knee = 0.28 if is_hdr_contrast else 0.45
-        hl_prot = _smoothstep_f32(0.82, hl_knee, hl_ref)
-        glare_damp = (np.float32(1.0) - np.float32(0.68) * flare_field).astype(np.float32)
-        gain = (np.float32(1.0) + (gain_safe * glare_damp - np.float32(1.0)) * hl_prot).astype(np.float32)
+        hl_prot = _smoothstep_f32(0.85, hl_knee, hl_ref)
+        gain_scene = np.float32(1.0) + (raw_gain - np.float32(1.0)) * hl_prot
+        gain_lamp = np.float32(1.0) + (gain_glare_safe * (np.float32(1.0) - np.float32(0.70) * w_glare) - np.float32(1.0)) * hl_prot
+        gain_combined = (gain_scene * (np.float32(1.0) - w_glare) + gain_lamp * w_glare).astype(np.float32)
 
-        # Smooth shadow toe protection: prevents dark floors, borders & deep blacks from lifting into milky gray
+        # Smooth shadow toe protection: anchors true pitch-black night skies while giving full 4K lift to roads/foliage
         p02 = float(np.percentile(lum_in, 2))
-        p25 = float(np.percentile(lum_in, 25))
-        floor_level = max(0.045, p25 * 0.90) if is_backlit_night else max(0.015, p02)
-        toe = _smoothstep_f32(floor_level * 0.90, floor_level + 0.08, lum_in)
-        gain_eff = (np.float32(1.0) + (gain - np.float32(1.0)) * toe).astype(np.float32)
+        floor_level = max(0.020, p02 * 0.95) if is_backlit_night else max(0.015, p02)
+        toe = _smoothstep_f32(floor_level * 0.80, floor_level + 0.05, lum_in)
+        gain_eff = (np.float32(1.0) + (gain_combined - np.float32(1.0)) * toe).astype(np.float32)
         lifted = np.clip(img_f * gain_eff[:, :, None], 0.0, 1.0).astype(np.float32)
 
         # Local Optical De-Veiling (restores foliage & silhouettes washed out by lamp glare)
@@ -332,7 +332,7 @@ class ClassicalEnhancer:
                 lum_l = _luma_f32(lifted)
                 base_l = cv2.GaussianBlur(lum_l, (0, 0), sigmaX=5.0)
                 high_freq = (lum_l - base_l).astype(np.float32)
-                deveil = (high_freq * flare_field * np.float32(0.75)).astype(np.float32)
+                deveil = (high_freq * w_glare * np.float32(0.80)).astype(np.float32)
                 lifted = np.clip(lifted + deveil[:, :, None], 0.0, 1.0).astype(np.float32)
             except ImportError:
                 pass
@@ -1704,7 +1704,7 @@ def run_inference_cached(
     full_res: bool = True,
     output_res: str = "4K UHD (3840px Crisp)",
     super_sample: str = "HD Super-Sample (2× IBP + De-Blur)",
-    engine_version: str = "v4k_pro_acutance_2026",
+    engine_version: str = "v4k_max_hdr_clarity_2026",
 ) -> dict:
     """Cached inference so repeated clicks don't re-run."""
     pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
